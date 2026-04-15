@@ -1,5 +1,5 @@
 "use client";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -22,8 +22,8 @@ export default function OrderTable({ rows, globalFilter, visibleColumns }: Props
   const [sorting, setSorting] = useState<SortingState>([]);
   const [data,    setData]    = useState<OrderRow[]>(rows);
 
-  // rows가 바뀌면 동기화
-  useMemo(() => setData(rows), [rows]);
+  // rows가 바뀌면 동기화 (useEffect 사용)
+  useEffect(() => { setData(rows); }, [rows]);
 
   const handleStatusUpdate = (itemId: string, newStatus: OrderStatus) => {
     setData((prev) =>
@@ -31,7 +31,7 @@ export default function OrderTable({ rows, globalFilter, visibleColumns }: Props
     );
   };
 
-  const allColumns: ColumnDef<OrderRow>[] = [
+  const allColumns: ColumnDef<OrderRow>[] = useMemo(() => [
     { accessorKey: "manager_code",    header: "알파벳",    size: 70  },
     { accessorKey: "barcode",         header: "미등록주문", size: 90  },
     { accessorKey: "order_date",      header: "주문일",    size: 90  },
@@ -81,13 +81,14 @@ export default function OrderTable({ rows, globalFilter, visibleColumns }: Props
     },
     { accessorKey: "status_history",  header: "상태이력",  size: 180 },
     { accessorKey: "change_log",      header: "변경내용",  size: 250 },
-  ];
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], []);
 
   const columns = useMemo(
     () => visibleColumns.length
       ? allColumns.filter((c) => visibleColumns.includes(c.accessorKey as string))
       : allColumns,
-    [visibleColumns, data]
+    [visibleColumns, allColumns]
   );
 
   const table = useReactTable({
