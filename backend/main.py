@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-주문 관리 시스템 - FastAPI 백엔드 v3.0
-역할: 엑셀 파일 파싱 + 주문번호 생성(로컬) + Supabase 저장
-최적화: generate_order_no RPC 완전 제거 → 34K행 처리 ~60초
+주문 관리 시스템 - FastAPI 백엔드
+역할: 엑셀 파일 파싱 + 주문번호 생성 + Supabase 저장
+비동기 처리: 대용량 파일은 background thread로 처리 후 polling
 """
 import os
 import io
-import sys
 import threading
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +13,6 @@ from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
 from excel_processor import process_excel_file, export_to_excel
 from dotenv import load_dotenv
-
-# stdout 즉시 출력 (Railway 로그 버퍼링 방지)
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
 load_dotenv()
 
@@ -27,7 +23,7 @@ FRONTEND_URL         = os.getenv("FRONTEND_URL", "*")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL, SUPABASE_SERVICE_KEY 환경 변수를 설정해 주세요.")
 
-app = FastAPI(title="주문 관리 API", version="3.0.0")
+app = FastAPI(title="주문 관리 API", version="2.5.0")
 
 app.add_middleware(
     CORSMiddleware,
