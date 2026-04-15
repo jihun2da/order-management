@@ -264,13 +264,15 @@ def _get_buyer_id(row, buyer_cache):
 # ──────────────────────────────────────
 # 메인 처리 함수
 # ──────────────────────────────────────
-def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
-    upload_id = None
+def process_excel_file(file_contents: bytes, filename: str, supabase,
+                       pre_upload_id: str = None) -> dict:
+    upload_id = pre_upload_id
     try:
-        hist = supabase.table("upload_history").insert({
-            "filename": filename, "status": "처리중"
-        }).execute()
-        upload_id = hist.data[0]["id"]
+        if not upload_id:
+            hist = supabase.table("upload_history").insert({
+                "filename": filename, "status": "처리중"
+            }).execute()
+            upload_id = hist.data[0]["id"]
 
         wb = load_workbook(io.BytesIO(file_contents))
         ws = wb.active
