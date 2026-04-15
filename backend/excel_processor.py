@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-엑셀 처리 엔진
+엑셀 처리 엔진 v2.2
+- 고유번호 컬럼 우선 사용: 값 있으면 재업로드, 없으면 신규(번호 생성)
 - 셀 색상 → 상태 변환 (기존 로직 완전 보존)
 - 주문번호 생성: Supabase DB 함수 호출 (Race Condition 없음)
-- notes blob 제거 → order_items 개별 컬럼 저장
+- 완료 처리 → 번호 재활용 풀: DB 트리거 자동 처리
 """
 import io
 import re
@@ -28,7 +29,7 @@ EXACT_RGB_MAP = {
 }
 THEME_PATTERN_MAP = {
     (0, -0.249977): "택배비",
-    (5, 0.599994): "환불",
+    (5, 0.599994):  "환불",
 }
 DEFAULT_OFFICE_THEME = {
     0: (0,0,0), 1:(255,255,255), 2:(238,236,225),
@@ -51,7 +52,7 @@ def _color_to_rgb(color_obj) -> Optional[str]:
         rgb = color_obj.rgb
         return rgb[2:] if len(rgb) == 8 else rgb
     elif color_obj.type == "theme":
-        tid = color_obj.theme
+        tid  = color_obj.theme
         tint = color_obj.tint or 0.0
         if (tid, round(tint, 6)) in THEME_PATTERN_MAP:
             return None
@@ -112,28 +113,28 @@ def _get_col_map(ws) -> dict:
         return col_map.get(name, default)
 
     return {
-        "manager":        fc("알파벳",    1),
-        "barcode":        fc("미등록주문", 2),
-        "order_date":     fc("주문일",    3),
+        "manager":        fc("알파벳",      1),
+        "barcode":        fc("미등록주문",   2),
+        "order_date":     fc("주문일",      3),
         "user_id":        4,
-        "order_no":       fc("고유번호",  5),
-        "buyer":          fc("주문자명",  6),
-        "consignor":      fc("위탁자명",  7),
-        "brand":          fc("브랜드",    8),
-        "product":        fc("상품명",    9),
-        "color":          fc("색상",     10),
-        "size":           fc("사이즈",   11),
-        "quantity":       fc("수량",     12),
-        "options":        fc("상가",     13),
-        "wholesale":      fc("도매가",   14),
-        "supplier":       fc("미송",     15),
-        "notes":          fc("비고",     16),
-        "recipient_name": fc("이름",     17),
-        "phone":          fc("전화번호", 18),
-        "address":        fc("주소",     19),
+        "order_no":       fc("고유번호",    5),   # ★ 기존 주문번호 컬럼
+        "buyer":          fc("주문자명",    6),
+        "consignor":      fc("위탁자명",    7),
+        "brand":          fc("브랜드",      8),
+        "product":        fc("상품명",      9),
+        "color":          fc("색상",       10),
+        "size":           fc("사이즈",     11),
+        "quantity":       fc("수량",       12),
+        "options":        fc("상가",       13),
+        "wholesale":      fc("도매가",     14),
+        "supplier":       fc("미송",       15),
+        "notes":          fc("비고",       16),
+        "recipient_name": fc("이름",       17),
+        "phone":          fc("전화번호",   18),
+        "address":        fc("주소",       19),
         "buyer_user_id":  20,
         "delivery_msg":   fc("배송메세지", 21),
-        "code":           fc("코드",     22),
+        "code":           fc("코드",       22),
     }
 
 
@@ -148,13 +149,14 @@ def _val(ws, row, col):
 # 메인 처리 함수
 # ──────────────────────────────────────
 def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
-    # 업로드 이력 생성
-    hist = supabase.table("upload_history").insert({
-        "filename": filename, "status": "처리중"
-    }).execute()
-    upload_id = hist.data[0]["id"]
-
+    upload_id = None
     try:
+        # 업로드 이력 생성
+        hist = supabase.table("upload_history").insert({
+            "filename": filename, "status": "처리중"
+        }).select().execute()
+        upload_id = hist.data[0]["id"]
+
         wb = load_workbook(io.BytesIO(file_contents))
         ws = wb.active
         col = _get_col_map(ws)
@@ -167,30 +169,34 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
             if not buyer_name or not product_name:
                 continue
 
+            # ★ 고유번호 컬럼 읽기 (재업로드 판단 기준)
+            existing_order_no = _val(ws, r, col["order_no"]).strip()
+
             raw_rows.append({
-                "row_idx":        r,
-                "manager_code":   _extract_manager_code(_val(ws, r, col["manager"])),
-                "buyer_name":     buyer_name,
-                "buyer_user_id":  _val(ws, r, col["user_id"]),
-                "consignor_name": _val(ws, r, col["consignor"]),
-                "order_date":     _parse_date(ws.cell(r, col["order_date"]).value),
-                "product_name":   product_name,
-                "status":         _get_cell_status(ws.cell(r, col["product"])),
-                "quantity":       int(ws.cell(r, col["quantity"]).value or 1),
-                "color":          _val(ws, r, col["color"]),
-                "barcode":        _val(ws, r, col["barcode"]),
-                "brand":          _val(ws, r, col["brand"]),
-                "size":           _val(ws, r, col["size"]),
-                "options":        _val(ws, r, col["options"]),
-                "wholesale":      _val(ws, r, col["wholesale"]),
-                "supplier":       _val(ws, r, col["supplier"]),
-                "item_notes":     _val(ws, r, col["notes"]),
-                "recipient_name": _val(ws, r, col["recipient_name"]),
-                "phone":          _val(ws, r, col["phone"]),
-                "address":        _val(ws, r, col["address"]),          # 쉼표 포함 OK
-                "delivery_msg":   _val(ws, r, col["delivery_msg"]),     # 쉼표 포함 OK
-                "item_code":      _val(ws, r, col["code"]),
-                "bx_user_id":     _val(ws, r, col["buyer_user_id"]),
+                "row_idx":           r,
+                "existing_order_no": existing_order_no,   # ★ 핵심
+                "manager_code":      _extract_manager_code(_val(ws, r, col["manager"])),
+                "buyer_name":        buyer_name,
+                "buyer_user_id":     _val(ws, r, col["user_id"]),
+                "consignor_name":    _val(ws, r, col["consignor"]),
+                "order_date":        _parse_date(ws.cell(r, col["order_date"]).value),
+                "product_name":      product_name,
+                "status":            _get_cell_status(ws.cell(r, col["product"])),
+                "quantity":          int(ws.cell(r, col["quantity"]).value or 1),
+                "color":             _val(ws, r, col["color"]),
+                "barcode":           _val(ws, r, col["barcode"]),
+                "brand":             _val(ws, r, col["brand"]),
+                "size":              _val(ws, r, col["size"]),
+                "options":           _val(ws, r, col["options"]),
+                "wholesale":         _val(ws, r, col["wholesale"]),
+                "supplier":          _val(ws, r, col["supplier"]),
+                "item_notes":        _val(ws, r, col["notes"]),
+                "recipient_name":    _val(ws, r, col["recipient_name"]),
+                "phone":             _val(ws, r, col["phone"]),
+                "address":           _val(ws, r, col["address"]),
+                "delivery_msg":      _val(ws, r, col["delivery_msg"]),
+                "item_code":         _val(ws, r, col["code"]),
+                "bx_user_id":        _val(ws, r, col["buyer_user_id"]),
             })
 
         if not raw_rows:
@@ -200,22 +206,23 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
             return {"success": True, "upload_id": upload_id,
                     "inserted": 0, "updated": 0, "errors": []}
 
-        # ─── 2단계: (buyer, consignor, date, manager) 기준으로 그룹화 ───
-        groups: dict = defaultdict(list)
+        # ─── 2단계: 신규 행만 그룹화 (고유번호 없는 행) ───
+        # 고유번호가 없는 행들만 그룹화하여 seq 번호 부여
+        new_rows_groups: dict = defaultdict(list)
         for row in raw_rows:
-            key = (row["buyer_name"], row["consignor_name"],
-                   row["order_date"],  row["manager_code"])
-            groups[key].append(row)
+            if not row["existing_order_no"]:
+                key = (row["buyer_name"], row["consignor_name"],
+                       row["order_date"],  row["manager_code"])
+                new_rows_groups[key].append(row)
 
-        # ─── 3단계: 그룹별 seq 번호 부여 ───
-        for (buyer_name, consignor_name, order_date, manager_code), items in groups.items():
+        for (buyer_name, consignor_name, order_date, manager_code), items in new_rows_groups.items():
             total = len(items)
             for idx, item in enumerate(items, 1):
-                item["seq_num"]     = idx
-                item["total_count"] = total
+                item["seq_num"]        = idx
+                item["total_count"]    = total
                 item["is_consignment"] = (buyer_name == consignor_name)
 
-        # ─── 4단계: DB에 저장 ───
+        # ─── 3단계: DB에 저장 ───
         inserted = 0
         updated  = 0
         errors   = []
@@ -223,107 +230,210 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
 
         for row in raw_rows:
             try:
-                # 담당자
-                mgr_res = supabase.rpc("get_or_create_manager",
-                                       {"p_code": row["manager_code"]}).execute()
-                manager_id = mgr_res.data
+                # ══════════════════════════════════════════
+                # 고유번호가 이미 있는 경우 → 재업로드 처리
+                # ══════════════════════════════════════════
+                if row["existing_order_no"]:
+                    order_no = row["existing_order_no"]
 
-                # 주문자
-                buyer_res = supabase.rpc("get_or_create_buyer", {
-                    "p_name":    row["buyer_name"],
-                    "p_user_id": row["buyer_user_id"] or None,
-                    "p_phone":   row["phone"] or None,
-                }).execute()
-                buyer_id = buyer_res.data
+                    # 주문 조회
+                    existing_order = supabase.table("orders").select("id,order_no,manager_id").eq(
+                        "order_no", order_no).execute().data
 
-                # 위탁자
-                consignor_id = None
-                if row["consignor_name"]:
-                    con_res = supabase.rpc("get_or_create_consignor",
-                                           {"p_name": row["consignor_name"]}).execute()
-                    consignor_id = con_res.data
+                    if not existing_order:
+                        errors.append(f"행 {row['row_idx']}: 고유번호 '{order_no}' 주문을 찾을 수 없습니다")
+                        continue
 
-                # 주문번호 생성 (DB 함수: Race Condition 완전 해결)
-                order_no = supabase.rpc("generate_order_no", {
-                    "p_manager_code":   row["manager_code"],
-                    "p_order_date":     row["order_date"],
-                    "p_buyer_id":       buyer_id,
-                    "p_consignor_id":   consignor_id,
-                    "p_is_consignment": row["is_consignment"],
-                    "p_seq_num":        row["seq_num"],
-                    "p_total_count":    row["total_count"],
-                }).execute().data
-
-                # 주문 조회 또는 생성
-                existing_order = supabase.table("orders").select("id").eq(
-                    "order_no", order_no).execute().data
-
-                if existing_order:
                     order_id = existing_order[0]["id"]
-                    updated += 1
+
+                    # 아이템 조회 (product_name으로 매칭)
+                    existing_item = supabase.table("order_items").select(
+                        "id,status,quantity,color,status_history,change_log"
+                    ).eq("order_id", order_id).eq("product_name", row["product_name"]).execute().data
+
+                    if existing_item:
+                        # ── 기존 아이템 업데이트 ──
+                        item = existing_item[0]
+                        changes = []
+                        patch = {}
+
+                        new_status = row["status"]
+
+                        if item["status"] != new_status:
+                            changes.append(f"상태: {item['status']} → {new_status}")
+                            patch["status"]         = new_status
+                            patch["status_history"] = (
+                                (item.get("status_history") or item["status"]) + " → " + new_status
+                            )
+
+                        if item["quantity"] != row["quantity"]:
+                            changes.append(f"수량: {item['quantity']} → {row['quantity']}")
+                            patch["quantity"] = row["quantity"]
+
+                        if row["color"] and item["color"] != row["color"]:
+                            changes.append(f"색상: {item['color'] or '없음'} → {row['color']}")
+                            patch["color"] = row["color"]
+
+                        change_note = (
+                            f"[{now_str}] 재업로드: {', '.join(changes)}"
+                            if changes else
+                            f"[{now_str}] 재업로드 (변경없음)"
+                        )
+                        existing_log = item.get("change_log") or ""
+                        patch["change_log"] = (existing_log + "\n" + change_note).strip()
+
+                        if patch:
+                            supabase.table("order_items").update(patch).eq("id", item["id"]).execute()
+
+                        # activity_log 기록
+                        supabase.table("activity_log").insert({
+                            "event_type":        "re_upload" if changes else "re_upload_no_change",
+                            "order_no":          order_no,
+                            "product_name":      row["product_name"],
+                            "manager_code":      row["manager_code"],
+                            "old_value":         item["status"],
+                            "new_value":         new_status,
+                            "note":              change_note,
+                            "upload_history_id": upload_id,
+                        }).execute()
+
+                        updated += 1
+
+                    else:
+                        # ── 같은 주문에 새 상품 추가 ──
+                        supabase.table("order_items").insert({
+                            "order_id":        order_id,
+                            "product_name":    row["product_name"],
+                            "quantity":        row["quantity"],
+                            "color":           row["color"]     or None,
+                            "status":          row["status"],
+                            "barcode":         row["barcode"]   or None,
+                            "brand":           row["brand"]     or None,
+                            "size":            row["size"]      or None,
+                            "options":         row["options"]   or None,
+                            "wholesale_price": row["wholesale"] or None,
+                            "supplier":        row["supplier"]  or None,
+                            "item_notes":      row["item_notes"] or None,
+                            "recipient_name":  row["recipient_name"] or None,
+                            "phone":           row["phone"]     or None,
+                            "address":         row["address"]   or None,
+                            "buyer_user_id":   row["bx_user_id"] or None,
+                            "delivery_msg":    row["delivery_msg"] or None,
+                            "item_code":       row["item_code"] or None,
+                            "status_history":  row["status"],
+                            "change_log":      f"[{now_str}] 기존 주문에 상품 추가",
+                        }).select("id").execute()
+
+                        supabase.table("activity_log").insert({
+                            "event_type":        "new_upload",
+                            "order_no":          order_no,
+                            "product_name":      row["product_name"],
+                            "manager_code":      row["manager_code"],
+                            "old_value":         None,
+                            "new_value":         row["status"],
+                            "note":              f"[{now_str}] 기존 주문에 상품 추가",
+                            "upload_history_id": upload_id,
+                        }).execute()
+
+                        inserted += 1
+
+                # ══════════════════════════════════════════
+                # 고유번호가 없는 경우 → 신규 주문번호 생성
+                # ══════════════════════════════════════════
                 else:
-                    new_order = supabase.table("orders").insert({
-                        "order_no":          order_no,
-                        "manager_id":        manager_id,
-                        "buyer_id":          buyer_id,
-                        "consignor_id":      consignor_id,
-                        "order_date":        row["order_date"],
-                        "status":            row["status"],
-                        "upload_history_id": upload_id,
+                    # 담당자
+                    mgr_res    = supabase.rpc("get_or_create_manager",
+                                              {"p_code": row["manager_code"]}).execute()
+                    manager_id = mgr_res.data
+
+                    # 주문자
+                    buyer_res = supabase.rpc("get_or_create_buyer", {
+                        "p_name":    row["buyer_name"],
+                        "p_user_id": row["buyer_user_id"] or None,
+                        "p_phone":   row["phone"] or None,
                     }).execute()
-                    order_id = new_order.data[0]["id"]
-                    inserted += 1
+                    buyer_id = buyer_res.data
 
-                # 주문 아이템 조회 또는 생성/수정
-                existing_item = supabase.table("order_items").select("id,status,quantity,color").eq(
-                    "order_id", order_id).eq("product_name", row["product_name"]).execute().data
+                    # 위탁자
+                    consignor_id = None
+                    if row["consignor_name"]:
+                        con_res      = supabase.rpc("get_or_create_consignor",
+                                                    {"p_name": row["consignor_name"]}).execute()
+                        consignor_id = con_res.data
 
-                if existing_item:
-                    item = existing_item[0]
-                    changes = []
-                    patch = {}
+                    # ★ 주문번호 생성 (DB 함수: Race Condition 완전 해결)
+                    # 형식: {prefix}{담당자코드}{YYMMDD}-{고객번호}({순번}/{총합})
+                    # 예시: A260415-5(1/2), #B260415-12(1/1)
+                    order_no = supabase.rpc("generate_order_no", {
+                        "p_manager_code":   row["manager_code"],
+                        "p_order_date":     row["order_date"],
+                        "p_buyer_id":       buyer_id,
+                        "p_consignor_id":   consignor_id,
+                        "p_is_consignment": row["is_consignment"],
+                        "p_seq_num":        row["seq_num"],
+                        "p_total_count":    row["total_count"],
+                    }).execute().data
 
-                    if item["status"] != row["status"]:
-                        changes.append(f"상태: {item['status']} → {row['status']}")
-                        patch["status"]         = row["status"]
-                        patch["status_history"] = (item.get("status_history") or item["status"]) + " → " + row["status"]
+                    # 주문 생성 (order_no 중복 시 기존 주문 사용)
+                    existing_order = supabase.table("orders").select("id").eq(
+                        "order_no", order_no).execute().data
 
-                    if item["quantity"] != row["quantity"]:
-                        changes.append(f"수량: {item['quantity']} → {row['quantity']}")
-                        patch["quantity"] = row["quantity"]
+                    if existing_order:
+                        order_id = existing_order[0]["id"]
+                    else:
+                        new_order = supabase.table("orders").insert({
+                            "order_no":          order_no,
+                            "manager_id":        manager_id,
+                            "buyer_id":          buyer_id,
+                            "consignor_id":      consignor_id,
+                            "order_date":        row["order_date"],
+                            "status":            row["status"],
+                            "upload_history_id": upload_id,
+                        }).select("id").execute()
+                        if not new_order.data:
+                            raise Exception(f"orders INSERT 실패 (빈 응답) — order_no={order_no}")
+                        order_id = new_order.data[0]["id"]
 
-                    if item["color"] != row["color"] and row["color"]:
-                        changes.append(f"색상: {item['color'] or '없음'} → {row['color']}")
-                        patch["color"] = row["color"]
+                    # 아이템 생성 (같은 주문에 동일 상품명이 이미 있으면 skip)
+                    dup = supabase.table("order_items").select("id").eq(
+                        "order_id", order_id).eq("product_name", row["product_name"]).execute().data
 
-                    if changes:
-                        patch["change_log"] = f"[{now_str}] {', '.join(changes)}"
+                    if not dup:
+                        supabase.table("order_items").insert({
+                            "order_id":        order_id,
+                            "product_name":    row["product_name"],
+                            "quantity":        row["quantity"],
+                            "color":           row["color"]     or None,
+                            "status":          row["status"],
+                            "barcode":         row["barcode"]   or None,
+                            "brand":           row["brand"]     or None,
+                            "size":            row["size"]      or None,
+                            "options":         row["options"]   or None,
+                            "wholesale_price": row["wholesale"] or None,
+                            "supplier":        row["supplier"]  or None,
+                            "item_notes":      row["item_notes"] or None,
+                            "recipient_name":  row["recipient_name"] or None,
+                            "phone":           row["phone"]     or None,
+                            "address":         row["address"]   or None,
+                            "buyer_user_id":   row["bx_user_id"] or None,
+                            "delivery_msg":    row["delivery_msg"] or None,
+                            "item_code":       row["item_code"] or None,
+                            "status_history":  row["status"],
+                            "change_log":      f"[{now_str}] 신규 등록 | 번호: {order_no}",
+                        }).select("id").execute()
 
-                    if patch:
-                        supabase.table("order_items").update(patch).eq("id", item["id"]).execute()
-                else:
-                    supabase.table("order_items").insert({
-                        "order_id":       order_id,
-                        "product_name":   row["product_name"],
-                        "quantity":       row["quantity"],
-                        "color":          row["color"] or None,
-                        "status":         row["status"],
-                        "barcode":        row["barcode"]   or None,
-                        "brand":          row["brand"]     or None,
-                        "size":           row["size"]      or None,
-                        "options":        row["options"]   or None,
-                        "wholesale_price": row["wholesale"] or None,
-                        "supplier":       row["supplier"]  or None,
-                        "item_notes":     row["item_notes"] or None,
-                        "recipient_name": row["recipient_name"] or None,
-                        "phone":          row["phone"]     or None,
-                        "address":        row["address"]   or None,   # 쉼표 OK
-                        "buyer_user_id":  row["bx_user_id"] or None,
-                        "delivery_msg":   row["delivery_msg"] or None, # 쉼표 OK
-                        "item_code":      row["item_code"] or None,
-                        "status_history": row["status"],
-                        "change_log":     f"[{now_str}] 신규 등록",
-                    }).execute()
+                        supabase.table("activity_log").insert({
+                            "event_type":        "new_upload",
+                            "order_no":          order_no,
+                            "product_name":      row["product_name"],
+                            "manager_code":      row["manager_code"],
+                            "old_value":         None,
+                            "new_value":         row["status"],
+                            "note":              f"[{now_str}] 신규 등록 | 번호: {order_no}",
+                            "upload_history_id": upload_id,
+                        }).execute()
+
+                        inserted += 1
 
             except Exception as e:
                 errors.append(f"행 {row['row_idx']}: {e}")
@@ -346,14 +456,21 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
         }
 
     except Exception as e:
-        supabase.table("upload_history").update({
-            "status": "실패", "error_message": str(e)
-        }).eq("id", upload_id).execute()
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[PROCESS ERROR] {e}\n{tb}")
+        if upload_id:
+            try:
+                supabase.table("upload_history").update({
+                    "status": "실패", "error_message": str(e)
+                }).eq("id", upload_id).execute()
+            except Exception:
+                pass
         return {"success": False, "error": str(e), "upload_id": upload_id}
 
 
 # ──────────────────────────────────────
-# 엑셀 내보내기 (색상 포함)
+# 엑셀 내보내기 (색상 포함 + 고유번호 포함)
 # ──────────────────────────────────────
 def export_to_excel(rows: list) -> bytes:
     wb = Workbook()
@@ -379,7 +496,7 @@ def export_to_excel(rows: list) -> bytes:
             row.get("barcode",""),
             row.get("order_date",""),
             row.get("buyer_user_id_ref",""),
-            row.get("order_no",""),
+            row.get("order_no",""),          # ★ 고유번호 포함
             row.get("buyer_name",""),
             row.get("consignor_name",""),
             row.get("brand",""),

@@ -56,20 +56,28 @@ async def upload_excel(file: UploadFile = File(...)):
     - 주문번호 Race Condition 방지: DB 함수(SELECT FOR UPDATE) 사용
     - 동일 주문 재업로드 시 상태/수량 변경 이력 자동 기록
     """
-    if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="Excel(.xlsx/.xls) 파일만 업로드 가능합니다.")
+    try:
+        if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
+            raise HTTPException(status_code=400, detail="Excel(.xlsx/.xls) 파일만 업로드 가능합니다.")
 
-    contents = await file.read()
-    if len(contents) > 20 * 1024 * 1024:  # 20MB 제한
-        raise HTTPException(status_code=413, detail="파일 크기가 20MB를 초과합니다.")
+        contents = await file.read()
+        if len(contents) > 20 * 1024 * 1024:  # 20MB 제한
+            raise HTTPException(status_code=413, detail="파일 크기가 20MB를 초과합니다.")
 
-    supabase = get_supabase()
-    result = process_excel_file(contents, file.filename, supabase)
+        supabase = get_supabase()
+        result = process_excel_file(contents, file.filename or "upload.xlsx", supabase)
 
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "처리 중 오류 발생"))
+        if not result.get("success"):
+            raise HTTPException(status_code=422, detail=result.get("error", "처리 중 오류 발생"))
 
-    return result
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[UPLOAD ERROR] {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=f"서버 오류: {str(e)}")
 
 
 # ─────────────────────────────────────
