@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 테이블 가로 스크롤 */
+.table-container { overflow-x: auto; }
+
+/* 상태 셀 클릭 커서 */
+.status-cell { cursor: pointer; user-select: none; }
