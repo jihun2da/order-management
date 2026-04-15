@@ -67,5 +67,4 @@ export interface Filters {
   status:     string;
   start_date: string;
   end_date:   string;
-  search:     string;
 }

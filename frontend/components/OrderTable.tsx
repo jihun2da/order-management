@@ -86,7 +86,10 @@ export default function OrderTable({ rows, globalFilter, visibleColumns }: Props
 
   const columns = useMemo(
     () => visibleColumns.length
-      ? allColumns.filter((c) => visibleColumns.includes(c.accessorKey as string))
+      ? allColumns.filter((c) => {
+          const key = (c as { accessorKey?: string }).accessorKey;
+          return key ? visibleColumns.includes(key) : false;
+        })
       : allColumns,
     [visibleColumns, allColumns]
   );
