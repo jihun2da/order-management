@@ -154,7 +154,7 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
         # 업로드 이력 생성
         hist = supabase.table("upload_history").insert({
             "filename": filename, "status": "처리중"
-        }).select().execute()
+        }).execute()
         upload_id = hist.data[0]["id"]
 
         wb = load_workbook(io.BytesIO(file_contents))
@@ -322,7 +322,7 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
                             "item_code":       row["item_code"] or None,
                             "status_history":  row["status"],
                             "change_log":      f"[{now_str}] 기존 주문에 상품 추가",
-                        }).select("id").execute()
+                        }).execute()
 
                         supabase.table("activity_log").insert({
                             "event_type":        "new_upload",
@@ -389,10 +389,16 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
                             "order_date":        row["order_date"],
                             "status":            row["status"],
                             "upload_history_id": upload_id,
-                        }).select("id").execute()
-                        if not new_order.data:
-                            raise Exception(f"orders INSERT 실패 (빈 응답) — order_no={order_no}")
-                        order_id = new_order.data[0]["id"]
+                        }).execute()
+                        if new_order.data:
+                            order_id = new_order.data[0]["id"]
+                        else:
+                            # 빈 응답일 경우 order_no로 재조회
+                            fallback = supabase.table("orders").select("id").eq(
+                                "order_no", order_no).execute()
+                            if not fallback.data:
+                                raise Exception(f"orders INSERT 실패 — order_no={order_no}")
+                            order_id = fallback.data[0]["id"]
 
                     # 아이템 생성 (같은 주문에 동일 상품명이 이미 있으면 skip)
                     dup = supabase.table("order_items").select("id").eq(
@@ -420,7 +426,7 @@ def process_excel_file(file_contents: bytes, filename: str, supabase) -> dict:
                             "item_code":       row["item_code"] or None,
                             "status_history":  row["status"],
                             "change_log":      f"[{now_str}] 신규 등록 | 번호: {order_no}",
-                        }).select("id").execute()
+                        }).execute()
 
                         supabase.table("activity_log").insert({
                             "event_type":        "new_upload",
