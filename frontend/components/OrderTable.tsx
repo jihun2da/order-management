@@ -14,17 +14,20 @@ import { OrderRow, OrderStatus, STATUS_ROW_COLORS } from "@/lib/types";
 import StatusBadge from "./StatusBadge";
 
 interface Props {
-  rows:           OrderRow[];
-  globalFilter:   string;
-  visibleColumns: string[];
-  isLoadingMore?: boolean;
-  totalCount?:    number;
+  rows:             OrderRow[];
+  globalFilter:     string;
+  visibleColumns:   string[];
+  isLoadingMore?:   boolean;
+  totalCount?:      number;
+  activeStatuses:   Set<OrderStatus>;
+  onToggleStatus:   (s: OrderStatus) => void;
 }
 
 const ROW_HEIGHT = 30; // px — 가상 스크롤 행 높이
 
 export default function OrderTable({
   rows, globalFilter, visibleColumns, isLoadingMore, totalCount,
+  activeStatuses, onToggleStatus,
 }: Props) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [data,    setData]    = useState<OrderRow[]>(rows);
@@ -133,15 +136,24 @@ export default function OrderTable({
         )}
         <span className="text-xs text-gray-300 mx-1">|</span>
         {(["입고대기","입고","미송","품절","교환","환불","택배비","완료"] as OrderStatus[]).map((s) => {
-          const c = STATUS_ROW_COLORS[s];
+          const c   = STATUS_ROW_COLORS[s];
+          const isOn = activeStatuses.has(s);
           return (
-            <span
+            <button
               key={s}
-              className="text-xs px-1.5 py-0.5 rounded border border-gray-300"
-              style={{ backgroundColor: c.bg || "#f9fafb", color: c.text }}
+              onClick={() => onToggleStatus(s)}
+              title={isOn ? `${s} 숨기기` : `${s} 표시하기`}
+              className="text-xs px-1.5 py-0.5 rounded border transition-all duration-150 cursor-pointer select-none"
+              style={{
+                backgroundColor: isOn ? (c.bg || "#f3f4f6") : "#1f2937",
+                color:           isOn ? c.text : "#9ca3af",
+                borderColor:     isOn ? "#d1d5db" : "#374151",
+                textDecoration:  isOn ? "none" : "line-through",
+                opacity:         isOn ? 1 : 0.65,
+              }}
             >
               {s}
-            </span>
+            </button>
           );
         })}
       </div>

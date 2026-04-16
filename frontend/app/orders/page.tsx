@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { getExportUrl } from "@/lib/api";
-import { OrderRow, UploadHistory, Filters, STATUS_LIST } from "@/lib/types";
+import { OrderRow, OrderStatus, UploadHistory, Filters, STATUS_LIST } from "@/lib/types";
 import OrderTable         from "@/components/OrderTable";
 import UploadSection      from "@/components/UploadSection";
 import UploadHistoryPanel from "@/components/UploadHistory";
@@ -41,9 +41,11 @@ export default function OrdersPage() {
   const [filters,     setFilters]     = useState<Filters>({
     manager: "", status: "", start_date: "", end_date: ""
   });
-  const [visibleCols, setVisibleCols] = useState<string[]>(ALL_COLUMN_KEYS);
-  const [showColMenu, setShowColMenu] = useState(false);
-  const [tab,         setTab]         = useState<"orders"|"upload"|"history">("orders");
+  const [visibleCols,    setVisibleCols]    = useState<string[]>(ALL_COLUMN_KEYS);
+  const [showColMenu,    setShowColMenu]    = useState(false);
+  const [tab,            setTab]            = useState<"orders"|"upload"|"history">("orders");
+  // ── 상태 토글 필터 (처음엔 전부 ON) ──
+  const [activeStatuses, setActiveStatuses] = useState<Set<OrderStatus>>(new Set(STATUS_LIST));
 
   // ── 인증 확인 ──
   useEffect(() => {
@@ -136,6 +138,16 @@ export default function OrdersPage() {
   useEffect(() => { loadOrders(); }, [loadOrders]);
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
+  // ── 상태 토글 ──
+  const toggleStatus = useCallback((s: OrderStatus) => {
+    setActiveStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s);
+      else next.add(s);
+      return next;
+    });
+  }, []);
+
   // ── 로그아웃 ──
   const handleLogout = async () => {
     await supabase.auth.signOut();
@@ -143,12 +155,15 @@ export default function OrdersPage() {
   };
 
   const filteredRows = useMemo(() => {
-    if (!search.trim()) return rows;
-    const q = search.toLowerCase();
-    return rows.filter((r) =>
-      Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q))
-    );
-  }, [rows, search]);
+    return rows.filter((r) => {
+      // 상태 토글 필터
+      if (!activeStatuses.has(r.item_status)) return false;
+      // 텍스트 검색
+      if (!search.trim()) return true;
+      const q = search.toLowerCase();
+      return Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q));
+    });
+  }, [rows, search, activeStatuses]);
 
   const loadingLabel = totalCount > 0
     ? `로딩 중... ${loadedCount.toLocaleString()} / ${totalCount.toLocaleString()}행`
@@ -304,6 +319,8 @@ export default function OrdersPage() {
                     visibleColumns={visibleCols}
                     isLoadingMore={loading}
                     totalCount={totalCount}
+                    activeStatuses={activeStatuses}
+                    onToggleStatus={toggleStatus}
                   />
               }
             </div>
