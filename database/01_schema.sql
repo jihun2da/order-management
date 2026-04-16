@@ -147,6 +147,20 @@ CREATE TABLE IF NOT EXISTS completed_order_numbers (
 CREATE INDEX IF NOT EXISTS idx_completed_manager ON completed_order_numbers(manager_code, completed_at);
 
 -- ──────────────────────────────────────
+-- 상태 변경 이력 테이블 (롤백 복원용)
+-- ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS order_item_status_logs (
+  id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  upload_history_id UUID        NOT NULL REFERENCES upload_history(id) ON DELETE CASCADE,
+  order_item_id     UUID        NOT NULL REFERENCES order_items(id)    ON DELETE CASCADE,
+  old_status        TEXT        NOT NULL,
+  new_status        TEXT        NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_oisl_upload ON order_item_status_logs(upload_history_id);
+CREATE INDEX IF NOT EXISTS idx_oisl_item   ON order_item_status_logs(order_item_id);
+
+-- ──────────────────────────────────────
 -- 통합 조회 뷰 (프론트엔드에서 직접 사용)
 -- ──────────────────────────────────────
 CREATE OR REPLACE VIEW orders_full AS

@@ -281,27 +281,116 @@ CREATE OR REPLACE TRIGGER trg_check_order_completion
   EXECUTE FUNCTION check_order_completion();
 
 -- ──────────────────────────────────────
--- 업로드 롤백 함수 (upload_history_id 기반 → 타임스탬프 비교 버그 해결)
+-- 업로드 롤백 함수 v2
+--   ① 상태 변경 복원 (입고대기→입고 업로드 후 롤백 시 입고대기로 되돌림)
+--   ② 롤백된 주문번호 재활용 풀에 추가 (빈 번호 재사용)
+--   ③ buyer_consignor_counters 정리 (남은 주문 없는 그룹 카운터 해제)
 -- ──────────────────────────────────────
 CREATE OR REPLACE FUNCTION rollback_upload(p_upload_id UUID)
 RETURNS JSONB AS $$
 DECLARE
-  v_deleted_count INTEGER := 0;
-  v_order_rec     RECORD;
+  v_deleted_count  INTEGER := 0;
+  v_restored_count INTEGER := 0;
+  v_log_rec        RECORD;
+  v_grp_rec        RECORD;
+  v_other_count    INTEGER;
+  v_base_num       INTEGER;
+  v_rep_order_no   TEXT;
 BEGIN
-  -- 해당 업로드의 주문 삭제 (CASCADE로 order_items 자동 삭제)
-  FOR v_order_rec IN
-    SELECT id, order_no FROM orders WHERE upload_history_id = p_upload_id
+
+  -- ① 상태 변경 복원
+  FOR v_log_rec IN
+    SELECT order_item_id, old_status, new_status
+    FROM   order_item_status_logs
+    WHERE  upload_history_id = p_upload_id
+    ORDER  BY created_at DESC
   LOOP
-    -- 재활용 풀에 있다면 제거 (롤백이므로 번호도 복구)
-    DELETE FROM completed_order_numbers WHERE order_no = v_order_rec.order_no;
-    DELETE FROM orders WHERE id = v_order_rec.id;
-    v_deleted_count := v_deleted_count + 1;
+    UPDATE order_items SET
+      status     = v_log_rec.old_status,
+      change_log = COALESCE(change_log, '') ||
+                   E'\n[' ||
+                   TO_CHAR(NOW() AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD HH24:MI') ||
+                   '] 롤백: ' || v_log_rec.new_status || '→' || v_log_rec.old_status,
+      updated_at = NOW()
+    WHERE id = v_log_rec.order_item_id;
+    v_restored_count := v_restored_count + 1;
+  END LOOP;
+  DELETE FROM order_item_status_logs WHERE upload_history_id = p_upload_id;
+
+  -- ② 신규 주문 그룹별 번호 재활용 + 카운터 해제 (삭제 전 수행)
+  FOR v_grp_rec IN
+    SELECT DISTINCT
+      o.buyer_id,
+      o.consignor_id,
+      m.code AS manager_code
+    FROM   orders   o
+    JOIN   managers m ON m.id = o.manager_id
+    WHERE  o.upload_history_id = p_upload_id
+  LOOP
+    -- 다른 업로드에도 이 그룹 주문이 있는지 확인
+    SELECT COUNT(*) INTO v_other_count
+    FROM   orders   o2
+    JOIN   managers m2 ON m2.id = o2.manager_id
+    WHERE  o2.buyer_id           = v_grp_rec.buyer_id
+      AND  m2.code               = v_grp_rec.manager_code
+      AND  o2.upload_history_id <> p_upload_id
+      AND  (
+             (v_grp_rec.consignor_id IS NULL AND o2.consignor_id IS NULL)
+          OR o2.consignor_id = v_grp_rec.consignor_id
+           );
+
+    IF v_other_count = 0 THEN
+      -- base_number + representative order_no 조회
+      SELECT
+        (regexp_match(o.order_no, '-(\d+)\('))[1]::INTEGER,
+        o.order_no
+      INTO v_base_num, v_rep_order_no
+      FROM   orders   o
+      JOIN   managers m ON m.id = o.manager_id
+      WHERE  o.buyer_id          = v_grp_rec.buyer_id
+        AND  m.code              = v_grp_rec.manager_code
+        AND  o.upload_history_id = p_upload_id
+        AND  (
+               (v_grp_rec.consignor_id IS NULL AND o.consignor_id IS NULL)
+            OR o.consignor_id = v_grp_rec.consignor_id
+             )
+      LIMIT 1;
+
+      -- 재활용 풀에 추가 (같은 manager_code + base_number 없을 때만)
+      IF v_base_num IS NOT NULL THEN
+        INSERT INTO completed_order_numbers (order_no, manager_code, base_number)
+        SELECT v_rep_order_no, v_grp_rec.manager_code, v_base_num
+        WHERE  NOT EXISTS (
+          SELECT 1 FROM completed_order_numbers
+          WHERE  manager_code = v_grp_rec.manager_code
+            AND  base_number  = v_base_num
+        );
+      END IF;
+
+      -- buyer_consignor_counters 카운터 해제
+      DELETE FROM buyer_consignor_counters
+      WHERE  buyer_id     = v_grp_rec.buyer_id
+        AND  manager_code = v_grp_rec.manager_code
+        AND  (
+               (v_grp_rec.consignor_id IS NULL AND consignor_id IS NULL)
+            OR consignor_id = v_grp_rec.consignor_id
+             );
+    END IF;
   END LOOP;
 
-  -- 업로드 이력 상태 업데이트
+  -- ③ 주문 삭제 (CASCADE → order_items 자동 삭제)
+  SELECT COUNT(*) INTO v_deleted_count
+  FROM   orders WHERE upload_history_id = p_upload_id;
+
+  DELETE FROM orders WHERE upload_history_id = p_upload_id;
+
+  -- ④ 업로드 이력 상태 갱신
   UPDATE upload_history SET status = '롤백완료' WHERE id = p_upload_id;
 
-  RETURN jsonb_build_object('success', TRUE, 'deleted', v_deleted_count);
+  RETURN jsonb_build_object(
+    'success',  TRUE,
+    'deleted',  v_deleted_count,
+    'restored', v_restored_count
+  );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
