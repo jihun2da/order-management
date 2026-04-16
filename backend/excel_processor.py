@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-엑셀 처리 엔진 v2.5 (완전 배치 최적화)
-핵심: 10,000회 RPC → 수십 회 배치 쿼리
-  - buyers/consignors/managers: 전체 한 번 fetch → 미존재 건만 bulk INSERT
-  - 초기 임포트: orders + items + activity_log 대량 bulk INSERT
-  - 재업로드: IN 쿼리 일괄 조회 후 변경 건만 UPDATE
-  - 34,000행 파일: 약 60~120초 예상
+엑셀 처리 엔진 v3.0 (완전 로컬 주문번호 생성)
+핵심 최적화:
+  - generate_order_no RPC 완전 제거: buyer_consignor_counters를 Python에서 직접 관리
+  - 34,000행 파일 예상 처리시간: 30~60초
+  - 모든 INSERT/UPDATE는 400개씩 배치 처리
 """
 import io
 import re
+import sys
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional
@@ -38,6 +38,11 @@ STATUS_COLORS = {
     "교환":"FFFFC000","환불":"FFE6B8B7","택배비":"FFBFBFBF",
 }
 BATCH = 400
+
+
+def _log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 # ── 색상 유틸 ──────────────────────────
@@ -74,6 +79,9 @@ def _parse_date(val):
         for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
             try: return datetime.strptime(val, fmt).date().isoformat()
             except: pass
+    if isinstance(val, (int, float)):
+        try: return datetime.strptime(str(int(val)), "%Y%m%d").date().isoformat()
+        except: pass
     return datetime.today().date().isoformat()
 
 def _extract_manager_code(val) -> str:
@@ -133,13 +141,6 @@ def _bulk_fetch_items(supabase, ids) -> dict:
 
 # ── 엔티티 캐시 빌더 ──────────────────
 def _build_entity_caches(supabase, raw_rows):
-    """
-    buyers, consignors, managers를 한 번에 resolve.
-    Returns: (mgr_cache, buyer_cache, con_cache)
-      mgr_cache:   code → id
-      buyer_cache: user_id or 'name||phone' → id
-      con_cache:   name → id
-    """
     # ─ managers ─
     mgr_codes = list({r["manager_code"] for r in raw_rows})
     existing_mgrs = supabase.table("managers").select("id,code").in_(
@@ -151,7 +152,6 @@ def _build_entity_caches(supabase, raw_rows):
             res = supabase.table("managers").insert(chunk).execute()
             if res.data:
                 for m in res.data: mgr_cache[m["code"]] = m["id"]
-        # fallback re-fetch if insert didn't return data
         if len(mgr_cache) < len(mgr_codes):
             refetch = supabase.table("managers").select("id,code").in_(
                 "code", mgr_codes).execute().data or []
@@ -176,44 +176,35 @@ def _build_entity_caches(supabase, raw_rows):
                     "name", chunk).execute().data or []
                 for c in rf: con_cache[c["name"]] = c["id"]
 
-    # ─ buyers (user_id 우선, fallback name) ─
-    # collect unique buyer data
-    buyer_uid_map = {}   # user_id → row info
-    buyer_name_map = {}  # name → row info (for those without user_id)
+    # ─ buyers ─
+    buyer_uid_map = {}
+    buyer_name_map = {}
     for r in raw_rows:
         uid = r["buyer_user_id"]
         if uid:
-            if uid not in buyer_uid_map:
-                buyer_uid_map[uid] = r
+            if uid not in buyer_uid_map: buyer_uid_map[uid] = r
         else:
             name = r["buyer_name"]
-            if name not in buyer_name_map:
-                buyer_name_map[name] = r
+            if name not in buyer_name_map: buyer_name_map[name] = r
 
-    buyer_cache = {}  # user_id or name → id
+    buyer_cache = {}
 
-    # fetch by user_id
     if buyer_uid_map:
         uids = list(buyer_uid_map.keys())
         for chunk in _chunks(uids, BATCH):
             data = supabase.table("buyers").select("id,user_id,name").in_(
                 "user_id", chunk).execute().data or []
-            for b in data:
-                buyer_cache[b["user_id"]] = b["id"]
+            for b in data: buyer_cache[b["user_id"]] = b["id"]
 
-    # fetch by name (for buyers without user_id)
     if buyer_name_map:
         names = list(buyer_name_map.keys())
         for chunk in _chunks(names, BATCH):
             data = supabase.table("buyers").select("id,name").in_(
                 "name", chunk).execute().data or []
-            for b in data:
-                buyer_cache[b["name"]] = b["id"]
+            for b in data: buyer_cache[b["name"]] = b["id"]
 
-    # insert missing buyers with user_id
     missing_uid_buyers = [
-        {"name": r["buyer_name"], "user_id": uid,
-         "phone": r["phone"] or None}
+        {"name": r["buyer_name"], "user_id": uid, "phone": r["phone"] or None}
         for uid, r in buyer_uid_map.items() if uid not in buyer_cache
     ]
     if missing_uid_buyers:
@@ -222,7 +213,6 @@ def _build_entity_caches(supabase, raw_rows):
             if res.data:
                 for b in res.data:
                     if b.get("user_id"): buyer_cache[b["user_id"]] = b["id"]
-        # re-fetch if needed
         missing_uids = [uid for uid in buyer_uid_map if uid not in buyer_cache]
         if missing_uids:
             for chunk in _chunks(missing_uids, BATCH):
@@ -230,19 +220,15 @@ def _build_entity_caches(supabase, raw_rows):
                     "user_id", chunk).execute().data or []
                 for b in rf: buyer_cache[b["user_id"]] = b["id"]
 
-    # insert missing buyers without user_id
     missing_name_buyers = [
-        {"name": name, "user_id": None,
-         "phone": r["phone"] or None}
+        {"name": name, "user_id": None, "phone": r["phone"] or None}
         for name, r in buyer_name_map.items() if name not in buyer_cache
     ]
     if missing_name_buyers:
         for chunk in _chunks(missing_name_buyers, BATCH):
             res = supabase.table("buyers").insert(chunk).execute()
             if res.data:
-                for b in res.data:
-                    buyer_cache[b["name"]] = b["id"]
-        # re-fetch if needed
+                for b in res.data: buyer_cache[b["name"]] = b["id"]
         missing_names = [n for n in buyer_name_map if n not in buyer_cache]
         if missing_names:
             for chunk in _chunks(missing_names, BATCH):
@@ -261,6 +247,94 @@ def _get_buyer_id(row, buyer_cache):
     return None
 
 
+# ── 로컬 주문번호 생성 (RPC 없이) ─────
+def _build_order_no_engine(supabase, groups):
+    """
+    buyer_consignor_counters 테이블을 직접 읽어 기존 base_number를 로드하고,
+    새 그룹에는 순차적으로 번호를 할당한 뒤 bulk INSERT 한다.
+    반환: group_key → base_number
+    Returns: {group_key: int}
+    """
+    # 그룹별 key 목록
+    group_list = list(groups.items())  # [(group_key, {buyer_id, consignor_id, manager_code}), ...]
+
+    # 1. 기존 카운터 전체 fetch (작은 테이블)
+    existing = supabase.table("buyer_consignor_counters").select(
+        "buyer_id,consignor_id,manager_code,base_number"
+    ).execute().data or []
+
+    counter_map = {}  # (buyer_id, consignor_id_or_None, manager_code) → base_number
+    for row in existing:
+        key = (str(row["buyer_id"]), str(row["consignor_id"]) if row["consignor_id"] else None, row["manager_code"])
+        counter_map[key] = row["base_number"]
+
+    # 2. 재활용 번호 fetch
+    recycled = supabase.table("completed_order_numbers").select(
+        "id,manager_code,base_number"
+    ).order("completed_at", desc=False).execute().data or []
+
+    recycled_by_mgr = defaultdict(list)
+    for r in recycled:
+        recycled_by_mgr[r["manager_code"]].append((r["id"], r["base_number"]))
+
+    # 3. 매니저별 현재 최대 번호 추적
+    max_by_mgr = defaultdict(int)
+    for (_, _, mc), bn in counter_map.items():
+        if bn > max_by_mgr[mc]: max_by_mgr[mc] = bn
+
+    # 4. 각 그룹에 base_number 할당
+    result = {}
+    new_counters = []    # DB에 INSERT할 새 카운터
+    recycled_to_delete = []  # 재활용 후 삭제할 ID
+
+    for gk, gdata in group_list:
+        buyer_id   = str(gdata["buyer_id"])
+        con_id_raw = gdata["consignor_id"]
+        con_id     = str(con_id_raw) if con_id_raw else None
+        mc         = gdata["manager_code"]
+
+        lookup_key = (buyer_id, con_id, mc)
+        if lookup_key in counter_map:
+            result[gk] = counter_map[lookup_key]
+        else:
+            # 재활용 풀 확인
+            if recycled_by_mgr[mc]:
+                rid, rbn = recycled_by_mgr[mc].pop(0)
+                base_num = rbn
+                recycled_to_delete.append(rid)
+            else:
+                max_by_mgr[mc] += 1
+                base_num = max_by_mgr[mc]
+
+            result[gk] = base_num
+            counter_map[lookup_key] = base_num
+            new_counters.append({
+                "buyer_id":     buyer_id,
+                "consignor_id": con_id,
+                "manager_code": mc,
+                "base_number":  base_num,
+            })
+
+    # 5. 새 카운터 bulk INSERT
+    if new_counters:
+        for chunk in _chunks(new_counters, BATCH):
+            try:
+                supabase.table("buyer_consignor_counters").insert(chunk).execute()
+            except Exception as e:
+                _log(f"[WARN] counter insert error: {e}")
+
+    # 6. 재활용된 번호 삭제
+    if recycled_to_delete:
+        for chunk in _chunks(recycled_to_delete, BATCH):
+            try:
+                supabase.table("completed_order_numbers").delete().in_(
+                    "id", chunk).execute()
+            except Exception as e:
+                _log(f"[WARN] recycled delete error: {e}")
+
+    return result
+
+
 # ──────────────────────────────────────
 # 메인 처리 함수
 # ──────────────────────────────────────
@@ -274,11 +348,14 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
             }).execute()
             upload_id = hist.data[0]["id"]
 
+        _log(f"[PROC] 시작: {filename}, upload_id={upload_id}")
+
         wb = load_workbook(io.BytesIO(file_contents))
         ws = wb.active
         col = _get_col_map(ws)
 
         # ─── 1단계: 행 파싱 ───
+        _log(f"[PROC] 행 파싱 중... (총 {ws.max_row}행)")
         raw_rows = []
         for r in range(2, ws.max_row + 1):
             buyer_name = _val(ws, r, col["buyer"])
@@ -311,6 +388,9 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                 "bx_user_id":        _val(ws, r, col["buyer_user_id"]),
             })
 
+        wb.close()  # 메모리 해제
+        _log(f"[PROC] 파싱 완료: {len(raw_rows)}행")
+
         if not raw_rows:
             supabase.table("upload_history").update(
                 {"status":"완료","rows_processed":0}).eq("id", upload_id).execute()
@@ -318,7 +398,7 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # ─── 2단계: 신규 행 seq 계산 ───
+        # ─── 2단계: 신규 행 그룹화 ───
         new_groups: dict = defaultdict(list)
         for row in raw_rows:
             if not row["existing_order_no"]:
@@ -331,19 +411,22 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                 item["total_count"] = total
                 item["is_consignment"] = (bn == cn)
 
-        # ─── 3단계: 엔티티 캐시 빌드 (핵심 최적화) ───
+        # ─── 3단계: 엔티티 캐시 빌드 ───
+        _log("[PROC] 엔티티 캐시 빌드 중...")
         mgr_cache, buyer_cache, con_cache = _build_entity_caches(supabase, raw_rows)
+        _log(f"[PROC] 엔티티 캐시 완료: mgr={len(mgr_cache)}, buyer={len(buyer_cache)}, con={len(con_cache)}")
 
         # ─── 4단계: 기존 주문 일괄 조회 ───
         all_nos = list({r["existing_order_no"] for r in raw_rows if r["existing_order_no"]})
         order_map = _bulk_fetch_orders(supabase, all_nos) if all_nos else {}
         order_ids = [o["id"] for o in order_map.values()]
         item_map  = _bulk_fetch_items(supabase, order_ids) if order_ids else {}
+        _log(f"[PROC] 기존 주문 조회: {len(order_map)}건")
 
         # ─── 5단계: 분류 ───
-        reupload_rows = []  # DB에 있는 order_no
-        import_rows   = []  # order_no 있지만 DB에 없음
-        new_rows      = []  # order_no 없음 (신규 생성 필요)
+        reupload_rows = []
+        import_rows   = []
+        new_rows      = []
 
         for row in raw_rows:
             ono = row["existing_order_no"]
@@ -351,6 +434,8 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                 (reupload_rows if ono in order_map else import_rows).append(row)
             else:
                 new_rows.append(row)
+
+        _log(f"[PROC] 분류: 재업로드={len(reupload_rows)}, 초기임포트={len(import_rows)}, 신규={len(new_rows)}")
 
         inserted = 0
         updated  = 0
@@ -429,9 +514,10 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                 errors.append(f"행 {row['row_idx']}: {e}")
 
         # ══════════════════════════════════════
-        # B: 초기 임포트 — 대량 bulk INSERT
+        # B: 초기 임포트 — bulk INSERT
         # ══════════════════════════════════════
         if import_rows:
+            _log(f"[PROC] 초기 임포트 {len(import_rows)}행 처리 중...")
             import_groups = defaultdict(list)
             for row in import_rows:
                 import_groups[row["existing_order_no"]].append(row)
@@ -453,7 +539,6 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                     "upload_history_id": upload_id,
                 })
 
-            # upsert (conflict = order_no unique)
             for chunk in _chunks(orders_to_insert, BATCH):
                 try:
                     supabase.table("orders").upsert(
@@ -464,7 +549,6 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
                         try: supabase.table("orders").insert(o).execute()
                         except: pass
 
-            # 삽입된 orders ID 조회
             new_ono_list = list(import_groups.keys())
             new_order_map = _bulk_fetch_orders(supabase, new_ono_list)
 
@@ -507,88 +591,154 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
             inserted += len(items_to_insert)
 
         # ══════════════════════════════════════
-        # C: 신규 (order_no 없음, generate)
+        # C: 신규 (order_no 없음) — 로컬 번호 생성
         # ══════════════════════════════════════
-        for row in new_rows:
-            try:
-                mgr_id = mgr_cache.get(row["manager_code"])
-                buy_id = _get_buyer_id(row, buyer_cache)
-                con_id = con_cache.get(row["consignor_name"]) if row["consignor_name"] else None
+        if new_rows:
+            _log(f"[PROC] 신규 주문 {len(new_rows)}행 처리 중 (그룹={len(new_groups)}개)...")
 
-                if not mgr_id or not buy_id:
-                    # fallback to RPC
-                    mgr_id = mgr_id or supabase.rpc(
-                        "get_or_create_manager", {"p_code": row["manager_code"]}).execute().data
-                    if not buy_id:
-                        buy_id = supabase.rpc("get_or_create_buyer", {
-                            "p_name": row["buyer_name"],
-                            "p_user_id": row["buyer_user_id"] or None,
-                            "p_phone": row["phone"] or None,
-                        }).execute().data
+            # 그룹별 엔티티 ID 수집
+            group_data = {}
+            for (bn, cn, od, mc), items in new_groups.items():
+                first = items[0]
+                buy_id = _get_buyer_id(first, buyer_cache)
+                con_id = con_cache.get(cn) if cn else None
+                mgr_id = mgr_cache.get(mc)
+                if not buy_id or not mgr_id:
+                    for it in items:
+                        errors.append(f"행 {it['row_idx']}: buyer/manager 조회 실패 (buyer={bn}, mgr={mc})")
+                    continue
+                gk = f"{bn}||{cn}||{od}||{mc}"
+                group_data[gk] = {
+                    "buyer_id":   buy_id,
+                    "consignor_id": con_id,
+                    "manager_code": mc,
+                    "manager_id": mgr_id,
+                    "buyer_id_str": str(buy_id),
+                    "con_id_str": str(con_id) if con_id else None,
+                }
 
-                if not con_id and row["consignor_name"]:
-                    con_id = supabase.rpc("get_or_create_consignor",
-                        {"p_name": row["consignor_name"]}).execute().data
+            # 로컬에서 base_number 할당 (RPC 없음)
+            _log("[PROC] 주문번호 생성 중 (로컬)...")
+            base_num_map = _build_order_no_engine(supabase, group_data)
+            _log(f"[PROC] 주문번호 생성 완료: {len(base_num_map)}개 그룹")
 
-                order_no = supabase.rpc("generate_order_no", {
-                    "p_manager_code":   row["manager_code"],
-                    "p_order_date":     row["order_date"],
-                    "p_buyer_id":       buy_id,
-                    "p_consignor_id":   con_id,
-                    "p_is_consignment": row["is_consignment"],
-                    "p_seq_num":        row["seq_num"],
-                    "p_total_count":    row["total_count"],
-                }).execute().data
+            # 주문번호 생성 함수
+            def make_order_no(mc, od, base_num, is_consignment, seq_num, total_count):
+                prefix = "#" if is_consignment else ""
+                # od는 "2026-04-14" → "260414"
+                try:
+                    ymd = datetime.strptime(od, "%Y-%m-%d").strftime("%y%m%d")
+                except Exception:
+                    ymd = od.replace("-", "")[2:8]
+                return f"{prefix}{mc}{ymd}-{base_num}({seq_num}/{total_count})"
 
-                ex = supabase.table("orders").select("id").eq("order_no", order_no).execute().data
-                if ex:
-                    order_id = ex[0]["id"]
-                else:
-                    res = supabase.table("orders").insert({
-                        "order_no": order_no, "manager_id": mgr_id,
-                        "buyer_id": buy_id, "consignor_id": con_id,
-                        "order_date": row["order_date"], "status": row["status"],
+            # 주문 및 아이템 배열 구성
+            orders_to_insert = []
+            items_meta = []  # (order_no, row)
+
+            for (bn, cn, od, mc), items in new_groups.items():
+                gk = f"{bn}||{cn}||{od}||{mc}"
+                if gk not in base_num_map:
+                    for it in items:
+                        errors.append(f"행 {it['row_idx']}: base_number 없음")
+                    continue
+
+                gdata = group_data.get(gk)
+                if not gdata:
+                    for it in items:
+                        errors.append(f"행 {it['row_idx']}: 그룹 데이터 없음")
+                    continue
+
+                base_num = base_num_map[gk]
+                total = len(items)
+
+                for idx, row in enumerate(items, 1):
+                    is_consignment = row["is_consignment"]
+                    seq = row["seq_num"]
+                    order_no = make_order_no(mc, od, base_num, is_consignment, seq, total)
+                    row["_order_no"] = order_no
+
+                    orders_to_insert.append({
+                        "order_no":          order_no,
+                        "manager_id":        str(gdata["manager_id"]),
+                        "buyer_id":          str(gdata["buyer_id"]),
+                        "consignor_id":      gdata["con_id_str"],
+                        "order_date":        od,
+                        "status":            row["status"],
                         "upload_history_id": upload_id,
-                    }).execute()
-                    if res.data:
-                        order_id = res.data[0]["id"]
-                    else:
-                        fb = supabase.table("orders").select("id").eq("order_no", order_no).execute()
-                        if not fb.data: raise Exception(f"orders INSERT 실패 {order_no}")
-                        order_id = fb.data[0]["id"]
-
-                dup = supabase.table("order_items").select("id").eq(
-                    "order_id", order_id).eq("product_name", row["product_name"]).execute().data
-                if not dup:
-                    supabase.table("order_items").insert({
-                        "order_id": order_id, "product_name": row["product_name"],
-                        "quantity": row["quantity"], "color": row["color"] or None,
-                        "status": row["status"], "barcode": row["barcode"] or None,
-                        "brand": row["brand"] or None, "size": row["size"] or None,
-                        "options": row["options"] or None,
-                        "wholesale_price": row["wholesale"] or None,
-                        "supplier": row["supplier"] or None,
-                        "item_notes": row["item_notes"] or None,
-                        "recipient_name": row["recipient_name"] or None,
-                        "phone": row["phone"] or None, "address": row["address"] or None,
-                        "buyer_user_id": row["bx_user_id"] or None,
-                        "delivery_msg": row["delivery_msg"] or None,
-                        "item_code": row["item_code"] or None,
-                        "status_history": row["status"],
-                        "change_log": f"[{now_str}] 신규 등록 | 번호: {order_no}",
-                    }).execute()
-                    activity_batch.append({
-                        "event_type":"new_upload","order_no":order_no,
-                        "product_name":row["product_name"],"manager_code":row["manager_code"],
-                        "old_value":None,"new_value":row["status"],
-                        "note":f"[{now_str}] 신규 등록","upload_history_id":upload_id,
                     })
-                    inserted += 1
-            except Exception as e:
-                errors.append(f"행 {row['row_idx']}: {e}")
+                    items_meta.append((order_no, row))
+
+            _log(f"[PROC] 주문 INSERT 중 ({len(orders_to_insert)}건)...")
+            # Bulk insert orders (ignore duplicates)
+            for chunk in _chunks(orders_to_insert, BATCH):
+                try:
+                    supabase.table("orders").upsert(
+                        chunk, on_conflict="order_no", ignore_duplicates=True
+                    ).execute()
+                except Exception as e:
+                    _log(f"[WARN] orders upsert error: {e}")
+                    for o in chunk:
+                        try: supabase.table("orders").insert(o).execute()
+                        except: pass
+
+            # Fetch inserted order IDs
+            all_new_nos = [o["order_no"] for o in orders_to_insert]
+            new_order_id_map = {}
+            for chunk in _chunks(all_new_nos, BATCH):
+                data = supabase.table("orders").select("id,order_no").in_(
+                    "order_no", chunk).execute().data or []
+                for r in data: new_order_id_map[r["order_no"]] = r["id"]
+
+            _log(f"[PROC] 아이템 INSERT 중 ({len(items_meta)}건)...")
+            items_to_insert = []
+            act_to_add = []
+            for (order_no, row) in items_meta:
+                oid = new_order_id_map.get(order_no)
+                if not oid:
+                    errors.append(f"행 {row['row_idx']}: order_id 조회 실패 {order_no}")
+                    continue
+                items_to_insert.append({
+                    "order_id":        oid,
+                    "product_name":    row["product_name"],
+                    "quantity":        row["quantity"],
+                    "color":           row["color"] or None,
+                    "status":          row["status"],
+                    "barcode":         row["barcode"] or None,
+                    "brand":           row["brand"] or None,
+                    "size":            row["size"] or None,
+                    "options":         row["options"] or None,
+                    "wholesale_price": row["wholesale"] or None,
+                    "supplier":        row["supplier"] or None,
+                    "item_notes":      row["item_notes"] or None,
+                    "recipient_name":  row["recipient_name"] or None,
+                    "phone":           row["phone"] or None,
+                    "address":         row["address"] or None,
+                    "buyer_user_id":   row["bx_user_id"] or None,
+                    "delivery_msg":    row["delivery_msg"] or None,
+                    "item_code":       row["item_code"] or None,
+                    "status_history":  row["status"],
+                    "change_log":      f"[{now_str}] 신규 등록 | 번호: {order_no}",
+                })
+                act_to_add.append({
+                    "event_type":   "new_upload",
+                    "order_no":     order_no,
+                    "product_name": row["product_name"],
+                    "manager_code": row["manager_code"],
+                    "old_value":    None,
+                    "new_value":    row["status"],
+                    "note":         f"[{now_str}] 신규 등록",
+                    "upload_history_id": upload_id,
+                })
+
+            _bulk_insert(supabase, "order_items", items_to_insert)
+            activity_batch.extend(act_to_add)
+            inserted += len(items_to_insert)
+            _log(f"[PROC] 신규 처리 완료: orders={len(orders_to_insert)}, items={len(items_to_insert)}")
 
         # activity_log 대량 INSERT
         if activity_batch:
+            _log(f"[PROC] activity_log INSERT 중 ({len(activity_batch)}건)...")
             _bulk_insert(supabase, "activity_log", activity_batch)
 
         supabase.table("upload_history").update({
@@ -598,12 +748,13 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
             "error_message": "\n".join(errors[:20]) if errors else None,
         }).eq("id", upload_id).execute()
 
+        _log(f"[PROC] 완료: inserted={inserted}, updated={updated}, errors={len(errors)}")
         return {"success":True,"upload_id":upload_id,
                 "inserted":inserted,"updated":updated,"errors":errors[:20]}
 
     except Exception as e:
         import traceback
-        print(f"[PROCESS ERROR] {e}\n{traceback.format_exc()}")
+        _log(f"[PROCESS ERROR] {e}\n{traceback.format_exc()}")
         if upload_id:
             try:
                 supabase.table("upload_history").update({
