@@ -749,8 +749,29 @@ def process_excel_file(file_contents: bytes, filename: str, supabase,
         }).eq("id", upload_id).execute()
 
         _log(f"[PROC] 완료: inserted={inserted}, updated={updated}, errors={len(errors)}")
+
+        # ── 다운로드용 엑셀 생성 (원본 형식 유지 + 신규 고유번호 기입) ──
+        download_bytes = None
+        try:
+            wb_dl = load_workbook(io.BytesIO(file_contents))
+            ws_dl = wb_dl.active
+            order_no_col = col["order_no"]
+            written = 0
+            for row in new_rows:
+                if row.get("_order_no"):
+                    ws_dl.cell(row["row_idx"], order_no_col).value = row["_order_no"]
+                    written += 1
+            out_buf = io.BytesIO()
+            wb_dl.save(out_buf)
+            wb_dl.close()
+            download_bytes = out_buf.getvalue()
+            _log(f"[PROC] 다운로드 엑셀 생성 완료: {written}개 고유번호 기입 ({len(download_bytes):,} bytes)")
+        except Exception as dl_err:
+            _log(f"[WARN] 다운로드 엑셀 생성 실패: {dl_err}")
+
         return {"success":True,"upload_id":upload_id,
-                "inserted":inserted,"updated":updated,"errors":errors[:20]}
+                "inserted":inserted,"updated":updated,"errors":errors[:20],
+                "download_bytes":download_bytes}
 
     except Exception as e:
         import traceback
