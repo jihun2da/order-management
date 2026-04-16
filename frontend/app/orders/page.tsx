@@ -436,7 +436,7 @@ export default function OrdersPage() {
 
           {tab === "upload" && (
             <div className="overflow-auto flex-1">
-              <UploadSection onSuccess={() => { loadOrders(); loadHistory(); setTab("orders"); }} />
+              <UploadSection onSuccess={() => { loadOrders(); loadHistory(); }} />
             </div>
           )}
 

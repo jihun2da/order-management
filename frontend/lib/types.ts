@@ -51,18 +51,6 @@ export const STATUS_COLORS: Record<OrderStatus, { bg: string; text: string }> = 
   "완료":     { bg: "bg-green-100",  text: "text-green-800" },
 };
 
-// 엑셀 원본 색상 (행 배경에 직접 적용)
-export const STATUS_ROW_COLORS: Record<OrderStatus, { bg: string; text: string }> = {
-  "입고대기": { bg: "",          text: "#374151" },
-  "입고":     { bg: "#FFFF00",   text: "#374151" },
-  "미송":     { bg: "#00FFFF",   text: "#374151" },
-  "품절":     { bg: "#FF0000",   text: "#ffffff" },
-  "교환":     { bg: "#FFC000",   text: "#374151" },
-  "환불":     { bg: "#E6B8B7",   text: "#374151" },
-  "택배비":   { bg: "#BFBFBF",   text: "#374151" },
-  "완료":     { bg: "#92D050",   text: "#374151" },
-};
-
 export interface UploadHistory {
   id:             string;
   filename:       string;
