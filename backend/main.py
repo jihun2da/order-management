@@ -227,6 +227,41 @@ async def rollback_upload(upload_id: str):
 
 
 # ─────────────────────────────────────
+# 처리중 stuck 업로드 정리 (관리자용)
+# ─────────────────────────────────────
+@app.post("/api/admin/cleanup-stuck")
+async def cleanup_stuck_uploads():
+    """5분 이상 '처리중' 상태로 남아있는 업로드를 '실패'로 일괄 업데이트"""
+    supabase = get_supabase()
+    try:
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+        stuck = supabase.table("upload_history").select("id,filename,upload_date") \
+            .eq("status", "처리중") \
+            .lt("upload_date", cutoff) \
+            .execute()
+
+        if not stuck.data:
+            return {"updated": 0, "message": "정리할 항목 없음"}
+
+        ids = [r["id"] for r in stuck.data]
+        for uid in ids:
+            supabase.table("upload_history").update({
+                "status": "실패",
+                "error_message": "처리 시간 초과 (서버 재시작 또는 타임아웃으로 중단됨)"
+            }).eq("id", uid).execute()
+
+        return {
+            "updated": len(ids),
+            "message": f"{len(ids)}건을 '실패'로 업데이트했습니다",
+            "items": [{"id": r["id"][:8] + "...", "filename": r["filename"]} for r in stuck.data]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────
 # 엑셀 내보내기 (주문목록 전체)
 # ─────────────────────────────────────
 @app.get("/api/export")

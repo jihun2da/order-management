@@ -436,7 +436,8 @@ export default function OrdersPage() {
 
           {tab === "upload" && (
             <div className="overflow-auto flex-1">
-              <UploadSection onSuccess={() => { loadOrders(); loadHistory(); }} />
+              {/* onSuccess: 업로드 탭 유지(명시) + 데이터 갱신 — setTab("upload")로 탭이탈 완전 방지 */}
+              <UploadSection onSuccess={() => { setTab("upload"); loadOrders(); loadHistory(); }} />
             </div>
           )}
 
