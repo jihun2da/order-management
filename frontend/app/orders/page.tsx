@@ -27,7 +27,8 @@ const COLUMN_LABELS: Record<string, string> = {
   change_log:"변경내용",
 };
 
-const PAGE_SIZE = 1000; // Supabase 기본 최대값
+const FETCH_PAGE_SIZE   = 1000; // Supabase 청크 크기
+const DISPLAY_PAGE_SIZE = 5000; // 화면 1페이지당 표시 행 수
 
 export default function OrdersPage() {
   const router = useRouter();
@@ -44,8 +45,11 @@ export default function OrdersPage() {
   const [visibleCols,    setVisibleCols]    = useState<string[]>(ALL_COLUMN_KEYS);
   const [showColMenu,    setShowColMenu]    = useState(false);
   const [tab,            setTab]            = useState<"orders"|"upload"|"history">("orders");
-  // ── 상태 토글 필터 (처음엔 전부 ON) ──
+  // ── 상태 토글 필터 ──
   const [activeStatuses, setActiveStatuses] = useState<Set<OrderStatus>>(new Set(STATUS_LIST));
+  // ── 페이지네이션 ──
+  const [currentPage,    setCurrentPage]    = useState(1);
+  const [showAll,        setShowAll]        = useState(false);
 
   // ── 인증 확인 ──
   useEffect(() => {
@@ -62,15 +66,15 @@ export default function OrdersPage() {
       });
   }, []);
 
-  // ── 주문 데이터 전체 로드 (1000행씩 청크, 순차 fetch) ──
+  // ── 주문 데이터 전체 로드 ──
   const loadOrders = useCallback(async () => {
     setLoading(true);
     setRows([]);
     setLoadedCount(0);
     setTotalCount(0);
+    setCurrentPage(1);
 
     try {
-      // 1단계: 전체 행 수 파악
       let countQ = supabase.from("orders_full").select("*", { count: "exact", head: true });
       if (filters.manager)    countQ = countQ.eq("manager_code", filters.manager);
       if (filters.status)     countQ = countQ.eq("item_status",  filters.status);
@@ -82,9 +86,8 @@ export default function OrdersPage() {
 
       if (total === 0) { setLoading(false); return; }
 
-      // 2단계: 병렬 fetch (최대 5개 동시)
       const allRows: OrderRow[] = new Array(total);
-      const pageCount = Math.ceil(total / PAGE_SIZE);
+      const pageCount  = Math.ceil(total / FETCH_PAGE_SIZE);
       const CONCURRENCY = 5;
 
       for (let batch = 0; batch < pageCount; batch += CONCURRENCY) {
@@ -94,8 +97,8 @@ export default function OrdersPage() {
         );
 
         await Promise.all(batchPages.map(async (page) => {
-          const from = page * PAGE_SIZE;
-          const to   = Math.min(from + PAGE_SIZE - 1, total - 1);
+          const from = page * FETCH_PAGE_SIZE;
+          const to   = Math.min(from + FETCH_PAGE_SIZE - 1, total - 1);
 
           let q = supabase.from("orders_full").select("*");
           if (filters.manager)    q = q.eq("manager_code", filters.manager);
@@ -111,9 +114,8 @@ export default function OrdersPage() {
           }
         }));
 
-        const loaded = Math.min((batch + CONCURRENCY) * PAGE_SIZE, total);
+        const loaded = Math.min((batch + CONCURRENCY) * FETCH_PAGE_SIZE, total);
         setLoadedCount(loaded);
-        // 점진적 업데이트: 처음 5000행 로드 후 미리 표시
         if (batch === 0) setRows(allRows.filter(Boolean).slice(0, loaded));
       }
 
@@ -146,7 +148,11 @@ export default function OrdersPage() {
       else next.add(s);
       return next;
     });
+    setCurrentPage(1);
   }, []);
+
+  // ── 검색/필터 변경 시 첫 페이지로 ──
+  useEffect(() => { setCurrentPage(1); }, [search]);
 
   // ── 로그아웃 ──
   const handleLogout = async () => {
@@ -154,20 +160,47 @@ export default function OrdersPage() {
     router.replace("/login");
   };
 
+  // ── 필터링된 전체 행 ──
   const filteredRows = useMemo(() => {
     return rows.filter((r) => {
-      // 상태 토글 필터
       if (!activeStatuses.has(r.item_status)) return false;
-      // 텍스트 검색
       if (!search.trim()) return true;
       const q = search.toLowerCase();
       return Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q));
     });
   }, [rows, search, activeStatuses]);
 
+  // ── 페이지네이션 계산 ──
+  const totalPages   = Math.max(1, Math.ceil(filteredRows.length / DISPLAY_PAGE_SIZE));
+  const safePage     = Math.min(currentPage, totalPages);
+
+  const paginatedRows = useMemo(() => {
+    if (showAll) return filteredRows;
+    const start = (safePage - 1) * DISPLAY_PAGE_SIZE;
+    return filteredRows.slice(start, start + DISPLAY_PAGE_SIZE);
+  }, [filteredRows, safePage, showAll]);
+
+  // 페이지 버튼 목록 생성 (최대 7개 표시, 중간은 … 처리)
+  const pageButtons = useMemo(() => {
+    const all = Array.from({ length: totalPages }, (_, i) => i + 1);
+    if (totalPages <= 7) return all as (number | "…")[];
+    const visible = new Set<number>([1, totalPages]);
+    for (let p = Math.max(1, safePage - 2); p <= Math.min(totalPages, safePage + 2); p++) visible.add(p);
+    const sorted = Array.from(visible).sort((a, b) => a - b);
+    const result: (number | "…")[] = [];
+    sorted.forEach((p, i) => {
+      if (i > 0 && p - sorted[i - 1] > 1) result.push("…");
+      result.push(p);
+    });
+    return result;
+  }, [totalPages, safePage]);
+
   const loadingLabel = totalCount > 0
     ? `로딩 중... ${loadedCount.toLocaleString()} / ${totalCount.toLocaleString()}행`
     : "데이터 로딩 중...";
+
+  const pageStart = (safePage - 1) * DISPLAY_PAGE_SIZE + 1;
+  const pageEnd   = Math.min(safePage * DISPLAY_PAGE_SIZE, filteredRows.length);
 
   return (
     <div className="flex flex-col min-h-screen">
@@ -273,7 +306,7 @@ export default function OrdersPage() {
           </div>
 
           {tab === "orders" && (
-            <div className="flex flex-col flex-1 min-h-0 gap-3">
+            <div className="flex flex-col flex-1 min-h-0 gap-2">
               {/* 검색 + 컬럼 선택 */}
               <div className="flex items-center gap-3 flex-wrap shrink-0">
                 <input
@@ -311,10 +344,11 @@ export default function OrdersPage() {
                 </div>
               </div>
 
+              {/* 테이블 영역 */}
               {loading && rows.length === 0
                 ? <div className="text-center py-16 text-gray-400">{loadingLabel}</div>
                 : <OrderTable
-                    rows={filteredRows}
+                    rows={paginatedRows}
                     globalFilter={search}
                     visibleColumns={visibleCols}
                     isLoadingMore={loading}
@@ -323,6 +357,80 @@ export default function OrdersPage() {
                     onToggleStatus={toggleStatus}
                   />
               }
+
+              {/* ── 페이지네이션 바 ── */}
+              {filteredRows.length > 0 && (
+                <div className="shrink-0 flex items-center justify-between border-t border-gray-100 pt-2 flex-wrap gap-2">
+                  {/* 좌측: 현재 범위 정보 */}
+                  <span className="text-xs text-gray-500">
+                    {showAll
+                      ? `전체 ${filteredRows.length.toLocaleString()}건 표시 중`
+                      : `${pageStart.toLocaleString()} ~ ${pageEnd.toLocaleString()}건 표시 / 전체 ${filteredRows.length.toLocaleString()}건`
+                    }
+                    {loading && (
+                      <span className="ml-2 text-blue-500 animate-pulse">▌ 로딩 중</span>
+                    )}
+                  </span>
+
+                  {/* 우측: 페이지 버튼들 + 전체보기 */}
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {!showAll && (
+                      <>
+                        {/* 처음/이전 */}
+                        <button
+                          disabled={safePage === 1}
+                          onClick={() => setCurrentPage(1)}
+                          className="px-1.5 py-1 text-xs border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >◀◀</button>
+                        <button
+                          disabled={safePage === 1}
+                          onClick={() => setCurrentPage((p) => p - 1)}
+                          className="px-2 py-1 text-xs border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >◀</button>
+
+                        {/* 페이지 번호 */}
+                        {pageButtons.map((p, i) =>
+                          p === "…"
+                            ? <span key={`dot-${i}`} className="px-1 text-xs text-gray-400 select-none">…</span>
+                            : <button
+                                key={p}
+                                onClick={() => setCurrentPage(p as number)}
+                                className={`w-7 h-7 text-xs rounded border transition ${
+                                  safePage === p
+                                    ? "bg-blue-500 text-white border-blue-500 font-bold"
+                                    : "border-gray-200 hover:bg-gray-50"
+                                }`}
+                              >{p}</button>
+                        )}
+
+                        {/* 다음/마지막 */}
+                        <button
+                          disabled={safePage === totalPages}
+                          onClick={() => setCurrentPage((p) => p + 1)}
+                          className="px-2 py-1 text-xs border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >▶</button>
+                        <button
+                          disabled={safePage === totalPages}
+                          onClick={() => setCurrentPage(totalPages)}
+                          className="px-1.5 py-1 text-xs border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                        >▶▶</button>
+                      </>
+                    )}
+
+                    {/* 전체보기 / 페이지 보기 토글 */}
+                    <button
+                      onClick={() => { setShowAll((v) => !v); setCurrentPage(1); }}
+                      className={`ml-1 px-2.5 py-1 text-xs rounded border transition font-medium ${
+                        showAll
+                          ? "bg-gray-800 text-white border-gray-800 hover:bg-gray-700"
+                          : "border-gray-300 text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      {showAll ? "페이지 보기" : "전체보기"}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
