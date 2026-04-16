@@ -4,8 +4,8 @@ import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { getExportUrl } from "@/lib/api";
 import { OrderRow, UploadHistory, Filters, STATUS_LIST } from "@/lib/types";
-import OrderTable    from "@/components/OrderTable";
-import UploadSection from "@/components/UploadSection";
+import OrderTable         from "@/components/OrderTable";
+import UploadSection      from "@/components/UploadSection";
 import UploadHistoryPanel from "@/components/UploadHistory";
 
 const ALL_COLUMN_KEYS = [
@@ -27,12 +27,16 @@ const COLUMN_LABELS: Record<string, string> = {
   change_log:"변경내용",
 };
 
+const PAGE_SIZE = 1000; // Supabase 기본 최대값
+
 export default function OrdersPage() {
   const router = useRouter();
   const [rows,        setRows]        = useState<OrderRow[]>([]);
   const [history,     setHistory]     = useState<UploadHistory[]>([]);
   const [managers,    setManagers]    = useState<string[]>([]);
   const [loading,     setLoading]     = useState(true);
+  const [loadedCount, setLoadedCount] = useState(0);
+  const [totalCount,  setTotalCount]  = useState(0);
   const [search,      setSearch]      = useState("");
   const [filters,     setFilters]     = useState<Filters>({
     manager: "", status: "", start_date: "", end_date: ""
@@ -56,19 +60,64 @@ export default function OrdersPage() {
       });
   }, []);
 
-  // ── 주문 데이터 로드 ──
+  // ── 주문 데이터 전체 로드 (1000행씩 청크, 순차 fetch) ──
   const loadOrders = useCallback(async () => {
     setLoading(true);
+    setRows([]);
+    setLoadedCount(0);
+    setTotalCount(0);
+
     try {
-      let q = supabase.from("orders_full").select("*");
-      if (filters.manager)    q = q.eq("manager_code", filters.manager);
-      if (filters.status)     q = q.eq("item_status",  filters.status);
-      if (filters.start_date) q = q.gte("order_date",  filters.start_date);
-      if (filters.end_date)   q = q.lte("order_date",  filters.end_date);
-      q = q.order("order_date", { ascending: false }).limit(5000);
-      const { data, error } = await q;
-      if (error) throw error;
-      setRows((data as OrderRow[]) || []);
+      // 1단계: 전체 행 수 파악
+      let countQ = supabase.from("orders_full").select("*", { count: "exact", head: true });
+      if (filters.manager)    countQ = countQ.eq("manager_code", filters.manager);
+      if (filters.status)     countQ = countQ.eq("item_status",  filters.status);
+      if (filters.start_date) countQ = countQ.gte("order_date",  filters.start_date);
+      if (filters.end_date)   countQ = countQ.lte("order_date",  filters.end_date);
+      const { count } = await countQ;
+      const total = count ?? 0;
+      setTotalCount(total);
+
+      if (total === 0) { setLoading(false); return; }
+
+      // 2단계: 병렬 fetch (최대 5개 동시)
+      const allRows: OrderRow[] = new Array(total);
+      const pageCount = Math.ceil(total / PAGE_SIZE);
+      const CONCURRENCY = 5;
+
+      for (let batch = 0; batch < pageCount; batch += CONCURRENCY) {
+        const batchPages = Array.from(
+          { length: Math.min(CONCURRENCY, pageCount - batch) },
+          (_, i) => batch + i
+        );
+
+        await Promise.all(batchPages.map(async (page) => {
+          const from = page * PAGE_SIZE;
+          const to   = Math.min(from + PAGE_SIZE - 1, total - 1);
+
+          let q = supabase.from("orders_full").select("*");
+          if (filters.manager)    q = q.eq("manager_code", filters.manager);
+          if (filters.status)     q = q.eq("item_status",  filters.status);
+          if (filters.start_date) q = q.gte("order_date",  filters.start_date);
+          if (filters.end_date)   q = q.lte("order_date",  filters.end_date);
+          q = q.order("order_date", { ascending: false }).range(from, to);
+
+          const { data, error } = await q;
+          if (error) throw error;
+          if (data) {
+            for (let i = 0; i < data.length; i++) allRows[from + i] = data[i] as OrderRow;
+          }
+        }));
+
+        const loaded = Math.min((batch + CONCURRENCY) * PAGE_SIZE, total);
+        setLoadedCount(loaded);
+        // 점진적 업데이트: 처음 5000행 로드 후 미리 표시
+        if (batch === 0) setRows(allRows.filter(Boolean).slice(0, loaded));
+      }
+
+      setRows(allRows.filter(Boolean) as OrderRow[]);
+    } catch (e) {
+      console.error("데이터 로드 실패:", e);
     } finally {
       setLoading(false);
     }
@@ -80,7 +129,7 @@ export default function OrdersPage() {
       .from("upload_history")
       .select("*")
       .order("upload_date", { ascending: false })
-      .limit(30);
+      .limit(50);
     setHistory((data as UploadHistory[]) || []);
   }, []);
 
@@ -101,13 +150,16 @@ export default function OrdersPage() {
     );
   }, [rows, search]);
 
+  const loadingLabel = totalCount > 0
+    ? `로딩 중... ${loadedCount.toLocaleString()} / ${totalCount.toLocaleString()}행`
+    : "데이터 로딩 중...";
+
   return (
     <div className="flex flex-col min-h-screen">
       {/* ── 상단 헤더 ── */}
       <header className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between sticky top-0 z-20 shadow-sm">
         <h1 className="text-lg font-bold text-gray-800">주문 관리 시스템</h1>
         <div className="flex items-center gap-3">
-          {/* 엑셀 다운로드 */}
           <a
             href={getExportUrl({
               manager: filters.manager,
@@ -173,12 +225,25 @@ export default function OrdersPage() {
           >
             필터 초기화
           </button>
+
+          {/* 로딩 진행률 */}
+          {loading && totalCount > 0 && (
+            <div className="mt-2">
+              <div className="text-xs text-gray-500 mb-1">{loadingLabel}</div>
+              <div className="w-full bg-gray-200 rounded-full h-1.5">
+                <div
+                  className="bg-blue-500 h-1.5 rounded-full transition-all"
+                  style={{ width: `${Math.round((loadedCount / totalCount) * 100)}%` }}
+                />
+              </div>
+            </div>
+          )}
         </aside>
 
         {/* ── 메인 컨텐츠 ── */}
-        <main className="flex-1 p-4 overflow-auto">
+        <main className="flex-1 p-4 overflow-hidden flex flex-col">
           {/* 탭 */}
-          <div className="flex gap-1 mb-4 border-b border-gray-200">
+          <div className="flex gap-1 mb-4 border-b border-gray-200 shrink-0">
             {(["orders","upload","history"] as const).map((t) => (
               <button
                 key={t}
@@ -193,9 +258,9 @@ export default function OrdersPage() {
           </div>
 
           {tab === "orders" && (
-            <div className="space-y-3">
+            <div className="flex flex-col flex-1 min-h-0 gap-3">
               {/* 검색 + 컬럼 선택 */}
-              <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-3 flex-wrap shrink-0">
                 <input
                   type="text"
                   value={search}
@@ -231,22 +296,32 @@ export default function OrdersPage() {
                 </div>
               </div>
 
-              {loading
-                ? <div className="text-center py-16 text-gray-400">데이터 로딩 중...</div>
-                : <OrderTable rows={filteredRows} globalFilter={search} visibleColumns={visibleCols} />
+              {loading && rows.length === 0
+                ? <div className="text-center py-16 text-gray-400">{loadingLabel}</div>
+                : <OrderTable
+                    rows={filteredRows}
+                    globalFilter={search}
+                    visibleColumns={visibleCols}
+                    isLoadingMore={loading}
+                    totalCount={totalCount}
+                  />
               }
             </div>
           )}
 
           {tab === "upload" && (
-            <UploadSection onSuccess={() => { loadOrders(); loadHistory(); setTab("orders"); }} />
+            <div className="overflow-auto flex-1">
+              <UploadSection onSuccess={() => { loadOrders(); loadHistory(); setTab("orders"); }} />
+            </div>
           )}
 
           {tab === "history" && (
-            <UploadHistoryPanel
-              history={history}
-              onRollback={() => { loadOrders(); loadHistory(); }}
-            />
+            <div className="overflow-auto flex-1">
+              <UploadHistoryPanel
+                history={history}
+                onRollback={() => { loadOrders(); loadHistory(); }}
+              />
+            </div>
           )}
         </main>
       </div>
