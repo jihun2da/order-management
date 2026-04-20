@@ -20,6 +20,29 @@ export async function rollbackUpload(uploadId: string) {
   return res.json();
 }
 
+export async function deleteItems(itemIds: string[], accessToken: string) {
+  const res = await fetch(`${API_URL}/api/admin/items`, {
+    method: "DELETE",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ item_ids: itemIds }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "삭제 실패");
+  }
+  return res.json();
+}
+
+export async function checkAdminMe(accessToken: string): Promise<boolean> {
+  const res = await fetch(`${API_URL}/api/admin/me`, {
+    headers: { "Authorization": `Bearer ${accessToken}` },
+  });
+  return res.ok;
+}
+
 export function getExportUrl(params: Record<string, string>) {
   const q = new URLSearchParams(
     Object.fromEntries(Object.entries(params).filter(([, v]) => v))

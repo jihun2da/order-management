@@ -22,6 +22,11 @@ interface Props {
   totalCount?:      number;
   activeStatuses:   Set<OrderStatus>;
   onToggleStatus:   (s: OrderStatus) => void;
+  // 관리자 삭제 모드
+  deleteMode?:      boolean;
+  selectedItems?:   Set<string>;
+  onSelectItem?:    (itemId: string, checked: boolean) => void;
+  onSelectAll?:     (checked: boolean) => void;
 }
 
 const ROW_HEIGHT = 30; // px — 가상 스크롤 행 높이
@@ -29,6 +34,7 @@ const ROW_HEIGHT = 30; // px — 가상 스크롤 행 높이
 export default function OrderTable({
   rows, globalFilter, visibleColumns, isLoadingMore, totalCount,
   activeStatuses, onToggleStatus,
+  deleteMode = false, selectedItems, onSelectItem, onSelectAll,
 }: Props) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [data,    setData]    = useState<OrderRow[]>(rows);
@@ -179,6 +185,21 @@ export default function OrderTable({
           <thead className="bg-gray-100 sticky top-0 z-10">
             {table.getHeaderGroups().map((hg) => (
               <tr key={hg.id}>
+                {/* 삭제 모드: 전체선택 체크박스 헤더 */}
+                {deleteMode && (
+                  <th className="px-2 py-2 w-8 border-b border-gray-200 bg-red-50">
+                    <input
+                      type="checkbox"
+                      className="cursor-pointer accent-red-500"
+                      checked={
+                        tableRows.length > 0 &&
+                        tableRows.every((r) => selectedItems?.has(r.original.item_id))
+                      }
+                      onChange={(e) => onSelectAll?.(e.target.checked)}
+                      title="전체 선택 / 해제"
+                    />
+                  </th>
+                )}
                 {hg.headers.map((h) => (
                   <th
                     key={h.id}
@@ -198,7 +219,7 @@ export default function OrderTable({
           <tbody>
             {tableRows.length === 0 ? (
               <tr>
-                <td colSpan={columns.length} className="text-center py-12 text-gray-400">
+                <td colSpan={deleteMode ? columns.length + 1 : columns.length} className="text-center py-12 text-gray-400">
                   데이터가 없습니다.
                 </td>
               </tr>
@@ -206,25 +227,37 @@ export default function OrderTable({
               <>
                 {/* 위쪽 패딩 (가상 스크롤용) */}
                 {paddingTop > 0 && (
-                  <tr><td colSpan={columns.length} style={{ height: paddingTop, padding: 0 }} /></tr>
+                  <tr><td colSpan={deleteMode ? columns.length + 1 : columns.length} style={{ height: paddingTop, padding: 0 }} /></tr>
                 )}
 
                 {/* 화면에 보이는 행만 렌더링 */}
                 {virtualItems.map((vRow) => {
                   const row = tableRows[vRow.index];
                   if (!row) return null;
-                  const rowColor = STATUS_ROW_COLORS[row.original.item_status] ?? STATUS_ROW_COLORS["입고대기"];
+                  const rowColor  = STATUS_ROW_COLORS[row.original.item_status] ?? STATUS_ROW_COLORS["입고대기"];
+                  const isChecked = selectedItems?.has(row.original.item_id) ?? false;
                   return (
                     <tr
                       key={row.id}
                       data-index={vRow.index}
                       style={{
                         height:          ROW_HEIGHT,
-                        backgroundColor: rowColor.bg || "#ffffff",
+                        backgroundColor: deleteMode && isChecked ? "#fee2e2" : (rowColor.bg || "#ffffff"),
                         color:           rowColor.text,
                       }}
                       className="border-b border-gray-200/60 hover:brightness-95 transition-[filter]"
                     >
+                      {/* 삭제 모드: 개별 체크박스 */}
+                      {deleteMode && (
+                        <td className="px-2 w-8" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            className="cursor-pointer accent-red-500"
+                            checked={isChecked}
+                            onChange={(e) => onSelectItem?.(row.original.item_id, e.target.checked)}
+                          />
+                        </td>
+                      )}
                       {row.getVisibleCells().map((cell) => (
                         <td
                           key={cell.id}
@@ -241,7 +274,7 @@ export default function OrderTable({
 
                 {/* 아래쪽 패딩 */}
                 {paddingBottom > 0 && (
-                  <tr><td colSpan={columns.length} style={{ height: paddingBottom, padding: 0 }} /></tr>
+                  <tr><td colSpan={deleteMode ? columns.length + 1 : columns.length} style={{ height: paddingBottom, padding: 0 }} /></tr>
                 )}
               </>
             )}

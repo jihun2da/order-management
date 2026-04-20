@@ -9,9 +9,11 @@ import io
 import sys
 import threading
 import urllib.parse
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from supabase import create_client, Client
 from excel_processor import process_excel_file, export_to_excel
 from dotenv import load_dotenv
@@ -23,7 +25,11 @@ load_dotenv()
 
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_ANON_KEY    = os.getenv("SUPABASE_ANON_KEY", "")
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "*")
+
+# ─── 관리자 이메일 목록 ───
+ADMIN_EMAILS = {"jihun2da@naver.com"}
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL, SUPABASE_SERVICE_KEY 환경 변수를 설정해 주세요.")
@@ -56,6 +62,35 @@ app.add_middleware(
 
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+# ─────────────────────────────────────
+# 관리자 JWT 검증
+# ─────────────────────────────────────
+async def verify_admin(authorization: str = Header(None)) -> dict:
+    """Authorization: Bearer <supabase_access_token> 헤더를 검증 후 관리자 확인"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="인증 헤더가 없습니다.")
+    token = authorization.split(" ", 1)[1]
+    try:
+        # Supabase service client로 사용자 JWT 검증
+        sb = get_supabase()
+        resp = sb.auth.get_user(token)
+        user = resp.user
+        if not user:
+            raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
+        email = user.email or ""
+        if email not in ADMIN_EMAILS:
+            raise HTTPException(status_code=403, detail="관리자 권한이 없습니다.")
+        return {"id": user.id, "email": email}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"인증 실패: {str(e)}")
+
+
+class DeleteItemsRequest(BaseModel):
+    item_ids: List[str]
 
 
 # ─────────────────────────────────────
@@ -259,6 +294,71 @@ async def cleanup_stuck_uploads():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────
+# 관리자 — 주문 항목 삭제
+# ─────────────────────────────────────
+@app.delete("/api/admin/items")
+async def delete_items(
+    body: DeleteItemsRequest,
+    admin: dict = Depends(verify_admin),
+):
+    """
+    선택된 order_items를 삭제.
+    - order_item_status_logs는 ON DELETE CASCADE로 자동 삭제
+    - 삭제 후 order_items가 하나도 없는 orphan orders도 함께 정리
+    """
+    if not body.item_ids:
+        raise HTTPException(status_code=400, detail="삭제할 항목 ID가 없습니다.")
+    if len(body.item_ids) > 5000:
+        raise HTTPException(status_code=400, detail="한 번에 최대 5,000건까지 삭제 가능합니다.")
+
+    supabase = get_supabase()
+    try:
+        print(f"[ADMIN DELETE] {admin['email']} → {len(body.item_ids)}건 삭제 요청")
+
+        # 1) 삭제 대상 order_items의 order_id 수집 (orphan 정리용)
+        items_resp = supabase.table("order_items").select("id, order_id") \
+            .in_("id", body.item_ids).execute()
+        order_ids = list({r["order_id"] for r in (items_resp.data or [])})
+
+        # 2) order_items 삭제 (status_logs는 CASCADE 자동 삭제)
+        del_resp = supabase.table("order_items") \
+            .delete().in_("id", body.item_ids).execute()
+        deleted_count = len(del_resp.data or [])
+
+        # 3) orphan orders 정리 (order_items가 0건인 orders 삭제)
+        orphan_deleted = 0
+        if order_ids:
+            remaining = supabase.table("order_items").select("order_id") \
+                .in_("order_id", order_ids).execute()
+            remaining_ids = {r["order_id"] for r in (remaining.data or [])}
+            orphan_ids = [oid for oid in order_ids if oid not in remaining_ids]
+            if orphan_ids:
+                orphan_resp = supabase.table("orders") \
+                    .delete().in_("id", orphan_ids).execute()
+                orphan_deleted = len(orphan_resp.data or [])
+
+        print(f"[ADMIN DELETE] 완료 — items:{deleted_count}, orphan orders:{orphan_deleted}")
+        return {
+            "deleted": deleted_count,
+            "orphan_orders_deleted": orphan_deleted,
+            "message": f"{deleted_count}건 삭제 완료"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────
+# 관리자 — 이메일 확인
+# ─────────────────────────────────────
+@app.get("/api/admin/me")
+async def admin_me(admin: dict = Depends(verify_admin)):
+    """관리자 여부 확인용 (프론트엔드 초기화 시 호출)"""
+    return {"email": admin["email"], "is_admin": True}
 
 
 # ─────────────────────────────────────

@@ -2,7 +2,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { getExportUrl } from "@/lib/api";
+import { getExportUrl, deleteItems, checkAdminMe } from "@/lib/api";
 import { OrderRow, OrderStatus, UploadHistory, Filters, STATUS_LIST } from "@/lib/types";
 import OrderTable         from "@/components/OrderTable";
 import UploadSection      from "@/components/UploadSection";
@@ -61,10 +61,22 @@ export default function OrdersPage() {
   // ── 업로드 완료 배너 (탭과 무관하게 상단에 표시) ──
   const [uploadBanner, setUploadBanner] = useState<UploadBanner | null>(null);
 
-  // ── 인증 확인 ──
+  // ── 관리자 삭제 모드 ──
+  const [isAdmin,       setIsAdmin]       = useState(false);
+  const [accessToken,   setAccessToken]   = useState<string>("");
+  const [deleteMode,    setDeleteMode]    = useState(false);
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteMsg,     setDeleteMsg]     = useState<string | null>(null);
+
+  // ── 인증 확인 + 관리자 여부 ──
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session) router.replace("/login");
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (!session) { router.replace("/login"); return; }
+      setAccessToken(session.access_token);
+      // 관리자 확인 (백엔드 JWT 검증)
+      const admin = await checkAdminMe(session.access_token).catch(() => false);
+      setIsAdmin(admin);
     });
   }, [router]);
 
@@ -161,6 +173,39 @@ export default function OrdersPage() {
     router.replace("/login");
   };
 
+  // ── 관리자 삭제 핸들러 ──
+  const handleSelectItem = useCallback((itemId: string, checked: boolean) => {
+    setSelectedItems((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(itemId);
+      else next.delete(itemId);
+      return next;
+    });
+  }, []);
+
+  // handleSelectAll — paginatedRows 정의 후 아래에서 선언
+  const handleSelectAllRef = useCallback((checked: boolean, pageRows: OrderRow[]) => {
+    setSelectedItems(checked ? new Set(pageRows.map((r) => r.item_id)) : new Set());
+  }, []);
+
+  const handleDeleteSelected = async () => {
+    if (selectedItems.size === 0) return;
+    if (!confirm(`선택된 ${selectedItems.size.toLocaleString()}건을 삭제합니다.\n이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?`)) return;
+    setDeleteLoading(true);
+    setDeleteMsg(null);
+    try {
+      const res = await deleteItems(Array.from(selectedItems), accessToken);
+      setDeleteMsg(`✅ ${res.deleted}건 삭제 완료`);
+      setSelectedItems(new Set());
+      setDeleteMode(false);
+      await loadOrders();
+    } catch (e: unknown) {
+      setDeleteMsg(`❌ 삭제 실패: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
   // ── 필터링 + 페이지네이션 ──
   const filteredRows = useMemo(() => rows.filter((r) => {
     if (!activeStatuses.has(r.item_status)) return false;
@@ -203,8 +248,24 @@ export default function OrdersPage() {
 
       {/* ── 상단 헤더 ── */}
       <header className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between sticky top-0 z-20 shadow-sm">
-        <h1 className="text-lg font-bold text-gray-800">주문 관리 시스템</h1>
+        <h1 className="text-lg font-bold text-gray-800">
+          주문 관리 시스템
+          {isAdmin && <span className="ml-2 text-xs bg-red-100 text-red-600 border border-red-200 px-1.5 py-0.5 rounded font-normal">관리자</span>}
+        </h1>
         <div className="flex items-center gap-3">
+          {/* 관리자 전용: 삭제 모드 토글 */}
+          {isAdmin && (
+            <button
+              onClick={() => { setDeleteMode((v) => !v); setSelectedItems(new Set()); setDeleteMsg(null); }}
+              className={`px-3 py-1.5 text-sm rounded-lg font-medium border transition ${
+                deleteMode
+                  ? "bg-red-600 text-white border-red-600 hover:bg-red-700"
+                  : "bg-red-50 text-red-600 border-red-200 hover:bg-red-100"
+              }`}
+            >
+              {deleteMode ? "✕ 삭제 모드 종료" : "🗑️ 삭제 모드"}
+            </button>
+          )}
           <a
             href={getExportUrl({ manager: filters.manager, status: filters.status, start: filters.start_date, end: filters.end_date })}
             className="px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg font-medium hover:bg-green-700 transition"
@@ -367,6 +428,36 @@ export default function OrdersPage() {
                 </div>
               </div>
 
+              {/* 관리자 삭제 모드 액션 바 */}
+              {deleteMode && (
+                <div className="shrink-0 flex items-center gap-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg">
+                  <span className="text-sm text-red-700 font-medium">
+                    {selectedItems.size > 0
+                      ? `${selectedItems.size.toLocaleString()}건 선택됨`
+                      : "삭제할 항목을 체크하세요"}
+                  </span>
+                  <button
+                    onClick={handleDeleteSelected}
+                    disabled={selectedItems.size === 0 || deleteLoading}
+                    className="px-3 py-1.5 bg-red-600 text-white text-sm rounded-lg font-medium hover:bg-red-700 disabled:opacity-40 transition"
+                  >
+                    {deleteLoading ? "삭제 중..." : `🗑️ 선택 삭제 (${selectedItems.size.toLocaleString()}건)`}
+                  </button>
+                  <button
+                    onClick={() => setSelectedItems(new Set())}
+                    disabled={selectedItems.size === 0}
+                    className="px-3 py-1.5 text-sm text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 transition"
+                  >
+                    선택 해제
+                  </button>
+                  {deleteMsg && (
+                    <span className={`text-sm font-medium ${deleteMsg.startsWith("✅") ? "text-green-700" : "text-red-700"}`}>
+                      {deleteMsg}
+                    </span>
+                  )}
+                </div>
+              )}
+
               {loading && rows.length === 0
                 ? <div className="text-center py-16 text-gray-400">{loadingLabel}</div>
                 : <OrderTable
@@ -377,6 +468,10 @@ export default function OrdersPage() {
                     totalCount={totalCount}
                     activeStatuses={activeStatuses}
                     onToggleStatus={toggleStatus}
+                    deleteMode={deleteMode}
+                    selectedItems={selectedItems}
+                    onSelectItem={handleSelectItem}
+                    onSelectAll={(checked) => handleSelectAllRef(checked, paginatedRows)}
                   />
               }
 
