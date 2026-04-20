@@ -6,6 +6,7 @@ v3.1: 업로드 후 고유번호 기입된 엑셀 다운로드 기능 추가
 """
 import os
 import io
+import re
 import sys
 import threading
 import urllib.parse
@@ -329,22 +330,95 @@ async def delete_items(
         deleted_count = len(del_resp.data or [])
 
         # 3) orphan orders 정리 (order_items가 0건인 orders 삭제)
-        orphan_deleted = 0
+        orphan_deleted  = 0
+        recycled_count  = 0
         if order_ids:
             remaining = supabase.table("order_items").select("order_id") \
                 .in_("order_id", order_ids).execute()
             remaining_ids = {r["order_id"] for r in (remaining.data or [])}
             orphan_ids = [oid for oid in order_ids if oid not in remaining_ids]
+
             if orphan_ids:
-                orphan_resp = supabase.table("orders") \
+                # ── 3-a) orphan orders 상세 조회 (삭제 전에 수집해야 함) ──
+                orphan_orders = supabase.table("orders") \
+                    .select("id, order_no, buyer_id, consignor_id, manager_id") \
+                    .in_("id", orphan_ids).execute().data or []
+
+                # manager_id → manager_code 매핑
+                mgr_ids = list({o["manager_id"] for o in orphan_orders if o.get("manager_id")})
+                mgr_map: dict = {}
+                if mgr_ids:
+                    mgrs = supabase.table("managers").select("id, code") \
+                        .in_("id", mgr_ids).execute().data or []
+                    mgr_map = {m["id"]: m["code"] for m in mgrs}
+
+                # ── 3-b) orphan orders 삭제 (기존 로직 유지) ──
+                orphan_resp  = supabase.table("orders") \
                     .delete().in_("id", orphan_ids).execute()
                 orphan_deleted = len(orphan_resp.data or [])
 
-        print(f"[ADMIN DELETE] 완료 — items:{deleted_count}, orphan orders:{orphan_deleted}")
+                # ── 3-c) 번호 재활용 처리 (rollback_upload 와 동일 로직) ──
+                for order in orphan_orders:
+                    buyer_id     = order.get("buyer_id")
+                    consignor_id = order.get("consignor_id")
+                    manager_id   = order.get("manager_id")
+                    order_no     = order.get("order_no", "")
+                    mc           = mgr_map.get(manager_id, "") if manager_id else ""
+                    if not mc or not order_no:
+                        continue
+
+                    # 같은 (buyer, consignor, manager) 그룹의 다른 orders 가 남아있는지 확인
+                    # → 남아있다면 카운터가 여전히 사용 중이므로 재활용 안 함
+                    chk_q = supabase.table("orders").select("id", count="exact") \
+                        .eq("buyer_id", buyer_id).eq("manager_id", manager_id)
+                    if consignor_id:
+                        chk_q = chk_q.eq("consignor_id", consignor_id)
+                    else:
+                        chk_q = chk_q.is_("consignor_id", "null")
+                    other_count = (chk_q.execute().count or 0)
+
+                    if other_count > 0:
+                        # 같은 그룹의 주문이 아직 있으므로 카운터 유지
+                        continue
+
+                    # base_number 추출: order_no 패턴 "-숫자(" (롤백 SQL 정규식과 동일)
+                    m = re.search(r"-(\d+)\(", order_no)
+                    if not m:
+                        continue
+                    base_num = int(m.group(1))
+
+                    # completed_order_numbers 에 추가 (중복 방지)
+                    existing_recycled = supabase.table("completed_order_numbers") \
+                        .select("id") \
+                        .eq("manager_code", mc) \
+                        .eq("base_number", base_num) \
+                        .execute().data or []
+                    if not existing_recycled:
+                        supabase.table("completed_order_numbers").insert({
+                            "order_no":     order_no,
+                            "manager_code": mc,
+                            "base_number":  base_num,
+                        }).execute()
+                        recycled_count += 1
+                        print(f"[ADMIN DELETE] 번호 재활용 등록: {order_no} (mc={mc}, base={base_num})")
+
+                    # buyer_consignor_counters 카운터 해제
+                    del_ctr_q = supabase.table("buyer_consignor_counters") \
+                        .delete() \
+                        .eq("buyer_id", buyer_id) \
+                        .eq("manager_code", mc)
+                    if consignor_id:
+                        del_ctr_q = del_ctr_q.eq("consignor_id", consignor_id)
+                    else:
+                        del_ctr_q = del_ctr_q.is_("consignor_id", "null")
+                    del_ctr_q.execute()
+
+        print(f"[ADMIN DELETE] 완료 — items:{deleted_count}, orphan orders:{orphan_deleted}, recycled:{recycled_count}")
         return {
-            "deleted": deleted_count,
+            "deleted":              deleted_count,
             "orphan_orders_deleted": orphan_deleted,
-            "message": f"{deleted_count}건 삭제 완료"
+            "recycled_numbers":     recycled_count,
+            "message":              f"{deleted_count}건 삭제 완료 (번호 {recycled_count}개 재활용 등록)",
         }
     except HTTPException:
         raise
