@@ -13,17 +13,6 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { OrderRow, OrderStatus, STATUS_ROW_COLORS } from "@/lib/types";
 import StatusBadge from "./StatusBadge";
 
-// 상태 필터 버튼 배지 색상 (Tailwind STATUS_COLORS에 대응하는 hex값)
-const STATUS_BTN_COLORS: Record<OrderStatus, { bg: string; text: string; border: string }> = {
-  "입고대기": { bg: "#f3f4f6", text: "#374151", border: "#d1d5db" },
-  "입고":     { bg: "#fef9c3", text: "#854d0e", border: "#fde68a" },
-  "미송":     { bg: "#cffafe", text: "#155e75", border: "#a5f3fc" },
-  "품절":     { bg: "#fee2e2", text: "#991b1b", border: "#fca5a5" },
-  "교환":     { bg: "#ffedd5", text: "#9a3412", border: "#fdba74" },
-  "환불":     { bg: "#fce7f3", text: "#9d174d", border: "#f9a8d4" },
-  "택배비":   { bg: "#e2e8f0", text: "#334155", border: "#cbd5e1" },
-  "완료":     { bg: "#dcfce7", text: "#166534", border: "#86efac" },
-};
 
 interface Props {
   rows:             OrderRow[];
@@ -148,7 +137,7 @@ export default function OrderTable({
         )}
         <span className="text-xs text-gray-300 mx-1">|</span>
         {(["입고대기","입고","미송","품절","교환","환불","택배비","완료"] as OrderStatus[]).map((s) => {
-          const c    = STATUS_BTN_COLORS[s];
+          const c    = STATUS_ROW_COLORS[s];
           const isOn = activeStatuses.has(s);
           return (
             <button
@@ -157,11 +146,11 @@ export default function OrderTable({
               title={isOn ? `${s} 숨기기` : `${s} 표시하기`}
               className="text-xs px-1.5 py-0.5 rounded border transition-all duration-150 cursor-pointer select-none font-medium"
               style={{
-                backgroundColor: isOn ? c.bg     : "#1f2937",
-                color:           isOn ? c.text   : "#9ca3af",
-                borderColor:     isOn ? c.border : "#374151",
+                backgroundColor: isOn ? (c.bg || "#f3f4f6") : "#1f2937",
+                color:           isOn ? c.text  : "#9ca3af",
+                borderColor:     isOn ? "#d1d5db" : "#374151",
                 textDecoration:  isOn ? "none"   : "line-through",
-                opacity:         isOn ? 1 : 0.55,
+                opacity:         isOn ? 1 : 0.65,
               }}
             >
               {s}

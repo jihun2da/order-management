@@ -51,16 +51,16 @@ export const STATUS_COLORS: Record<OrderStatus, { bg: string; text: string }> = 
   "완료":     { bg: "bg-green-100",  text: "text-green-800" },
 };
 
-// 테이블 행 배경색 (인라인 CSS — Tailwind 아님, OrderTable 가상스크롤에서 사용)
+// 테이블 행 배경색 + 상태 버튼 색 (인라인 CSS — 엑셀 원본 색상)
 export const STATUS_ROW_COLORS: Record<OrderStatus, { bg: string; text: string }> = {
-  "입고대기": { bg: "#ffffff",  text: "#374151" },
-  "입고":     { bg: "#fefce8",  text: "#713f12" },
-  "미송":     { bg: "#ecfeff",  text: "#155e75" },
-  "품절":     { bg: "#fef2f2",  text: "#991b1b" },
-  "교환":     { bg: "#fff7ed",  text: "#9a3412" },
-  "환불":     { bg: "#fdf4ff",  text: "#86198f" },
-  "택배비":   { bg: "#f1f5f9",  text: "#334155" },
-  "완료":     { bg: "#f0fdf4",  text: "#166534" },
+  "입고대기": { bg: "",          text: "#374151" },
+  "입고":     { bg: "#FFFF00",   text: "#374151" },
+  "미송":     { bg: "#00FFFF",   text: "#374151" },
+  "품절":     { bg: "#FF0000",   text: "#ffffff" },
+  "교환":     { bg: "#FFC000",   text: "#374151" },
+  "환불":     { bg: "#E6B8B7",   text: "#374151" },
+  "택배비":   { bg: "#BFBFBF",   text: "#374151" },
+  "완료":     { bg: "#92D050",   text: "#374151" },
 };
 
 export interface UploadHistory {
