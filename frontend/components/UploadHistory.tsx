@@ -3,6 +3,8 @@ import { useState } from "react";
 import { UploadHistory as UH } from "@/lib/types";
 import { rollbackUpload } from "@/lib/api";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 interface Props { history: UH[]; onRollback: () => void; }
 
 export default function UploadHistoryPanel({ history, onRollback }: Props) {
@@ -24,12 +26,20 @@ export default function UploadHistoryPanel({ history, onRollback }: Props) {
     }
   };
 
+  const handleDownload = (id: string) => {
+    window.open(`${API_URL}/api/upload/${id}/download`, "_blank");
+  };
+
   const statusColor = (s: string) => {
     if (s === "완료")      return "text-green-600";
     if (s === "실패")      return "text-red-600";
     if (s === "롤백완료")  return "text-gray-400";
+    if (s === "처리중")    return "text-yellow-600";
     return "text-yellow-600";
   };
+
+  const canDownload = (s: string) => s === "완료" || s === "완료(오류있음)";
+  const canRollback = (s: string) => s === "완료" || s === "완료(오류있음)";
 
   return (
     <div className="bg-white rounded-xl border border-gray-200 p-4">
@@ -43,25 +53,42 @@ export default function UploadHistoryPanel({ history, onRollback }: Props) {
         <table className="w-full text-xs border-collapse">
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
-              {["파일명","업로드일","상태","처리","신규","수정","롤백"].map((h) => (
+              {["파일명","업로드일","상태","처리","신규","수정","다운로드","롤백"].map((h) => (
                 <th key={h} className="px-3 py-2 text-left font-semibold text-gray-500">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {history.length === 0 ? (
-              <tr><td colSpan={7} className="text-center py-6 text-gray-400">업로드 이력이 없습니다.</td></tr>
+              <tr><td colSpan={8} className="text-center py-6 text-gray-400">업로드 이력이 없습니다.</td></tr>
             ) : (
               history.map((h) => (
                 <tr key={h.id} className="border-b border-gray-100 hover:bg-gray-50">
-                  <td className="px-3 py-1.5 max-w-[200px] truncate" title={h.filename}>{h.filename}</td>
+                  <td className="px-3 py-1.5 max-w-[180px] truncate" title={h.filename}>{h.filename}</td>
                   <td className="px-3 py-1.5 whitespace-nowrap">{h.upload_date.replace("T", " ").slice(0, 16)}</td>
                   <td className={`px-3 py-1.5 font-medium ${statusColor(h.status)}`}>{h.status}</td>
                   <td className="px-3 py-1.5">{h.rows_processed}</td>
                   <td className="px-3 py-1.5">{h.rows_inserted}</td>
                   <td className="px-3 py-1.5">{h.rows_updated}</td>
+
+                  {/* ── 다운로드 버튼 ── */}
                   <td className="px-3 py-1.5">
-                    {h.status === "완료" || h.status === "완료(오류있음)" ? (
+                    {canDownload(h.status) ? (
+                      <button
+                        onClick={() => handleDownload(h.id)}
+                        className="px-2 py-0.5 bg-green-50 text-green-700 border border-green-200 rounded hover:bg-green-100 transition text-xs whitespace-nowrap"
+                        title="고유번호 기입 엑셀 다운로드"
+                      >
+                        📥 다운로드
+                      </button>
+                    ) : (
+                      <span className="text-gray-300">—</span>
+                    )}
+                  </td>
+
+                  {/* ── 롤백 버튼 ── */}
+                  <td className="px-3 py-1.5">
+                    {canRollback(h.status) ? (
                       <button
                         onClick={() => handleRollback(h.id, h.filename)}
                         disabled={loading === h.id}
