@@ -95,6 +95,17 @@ class DeleteItemsRequest(BaseModel):
 
 
 # ─────────────────────────────────────
+# Supabase URL 안전 청크 헬퍼
+# ─────────────────────────────────────
+_SB_BATCH = 100  # Supabase PostgREST URL 길이 한계 안전값 (UUID 36자 × 100 ≈ 3,600자)
+
+def _sb_chunks(lst: list, n: int = _SB_BATCH):
+    """리스트를 n개씩 청크로 분할 (Supabase .in_() URL 초과 방지)"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+# ─────────────────────────────────────
 # 헬스 체크
 # ─────────────────────────────────────
 @app.get("/health")
@@ -320,42 +331,64 @@ async def delete_items(
         print(f"[ADMIN DELETE] {admin['email']} → {len(body.item_ids)}건 삭제 요청")
 
         # 1) 삭제 대상 order_items의 order_id 수집 (orphan 정리용)
-        items_resp = supabase.table("order_items").select("id, order_id") \
-            .in_("id", body.item_ids).execute()
-        order_ids = list({r["order_id"] for r in (items_resp.data or [])})
+        #    ★ 청크 분할 — body.item_ids 최대 5,000개, URL 초과 방지
+        items_data: list = []
+        for chunk in _sb_chunks(body.item_ids):
+            chunk_resp = supabase.table("order_items").select("id, order_id") \
+                .in_("id", chunk).execute()
+            items_data.extend(chunk_resp.data or [])
+        order_ids = list({r["order_id"] for r in items_data})
 
         # 2) order_items 삭제 (status_logs는 CASCADE 자동 삭제)
-        del_resp = supabase.table("order_items") \
-            .delete().in_("id", body.item_ids).execute()
-        deleted_count = len(del_resp.data or [])
+        #    ★ 청크 분할
+        deleted_count = 0
+        for chunk in _sb_chunks(body.item_ids):
+            chunk_del = supabase.table("order_items") \
+                .delete().in_("id", chunk).execute()
+            deleted_count += len(chunk_del.data or [])
 
         # 3) orphan orders 정리 (order_items가 0건인 orders 삭제)
         orphan_deleted  = 0
         recycled_count  = 0
         if order_ids:
-            remaining = supabase.table("order_items").select("order_id") \
-                .in_("order_id", order_ids).execute()
-            remaining_ids = {r["order_id"] for r in (remaining.data or [])}
+            # ★ 청크 분할 — order_ids 크기도 가변적
+            remaining_data: list = []
+            for chunk in _sb_chunks(order_ids):
+                chunk_rem = supabase.table("order_items").select("order_id") \
+                    .in_("order_id", chunk).execute()
+                remaining_data.extend(chunk_rem.data or [])
+            remaining_ids = {r["order_id"] for r in remaining_data}
             orphan_ids = [oid for oid in order_ids if oid not in remaining_ids]
 
             if orphan_ids:
                 # ── 3-a) orphan orders 상세 조회 (삭제 전에 수집해야 함) ──
-                orphan_orders = supabase.table("orders") \
-                    .select("id, order_no, buyer_id, consignor_id, manager_id") \
-                    .in_("id", orphan_ids).execute().data or []
+                #         ★ 청크 분할
+                orphan_orders: list = []
+                for chunk in _sb_chunks(orphan_ids):
+                    chunk_oo = supabase.table("orders") \
+                        .select("id, order_no, buyer_id, consignor_id, manager_id") \
+                        .in_("id", chunk).execute()
+                    orphan_orders.extend(chunk_oo.data or [])
 
                 # manager_id → manager_code 매핑
+                #   ★ 청크 분할 (mgr_ids 는 보통 소수이지만 안전하게)
                 mgr_ids = list({o["manager_id"] for o in orphan_orders if o.get("manager_id")})
                 mgr_map: dict = {}
                 if mgr_ids:
-                    mgrs = supabase.table("managers").select("id, code") \
-                        .in_("id", mgr_ids).execute().data or []
-                    mgr_map = {m["id"]: m["code"] for m in mgrs}
+                    mgrs_data: list = []
+                    for chunk in _sb_chunks(mgr_ids):
+                        chunk_mgr = supabase.table("managers").select("id, code") \
+                            .in_("id", chunk).execute()
+                        mgrs_data.extend(chunk_mgr.data or [])
+                    mgr_map = {m["id"]: m["code"] for m in mgrs_data}
 
                 # ── 3-b) orphan orders 삭제 (기존 로직 유지) ──
-                orphan_resp  = supabase.table("orders") \
-                    .delete().in_("id", orphan_ids).execute()
-                orphan_deleted = len(orphan_resp.data or [])
+                #         ★ 청크 분할
+                orphan_deleted = 0
+                for chunk in _sb_chunks(orphan_ids):
+                    chunk_od = supabase.table("orders") \
+                        .delete().in_("id", chunk).execute()
+                    orphan_deleted += len(chunk_od.data or [])
 
                 # ── 3-c) 번호 재활용 처리 (rollback_upload 와 동일 로직) ──
                 for order in orphan_orders:
