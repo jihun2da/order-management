@@ -62,12 +62,15 @@ export default function OrdersPage() {
   const [uploadBanner, setUploadBanner] = useState<UploadBanner | null>(null);
 
   // ── 관리자 삭제 모드 ──
-  const [isAdmin,       setIsAdmin]       = useState(false);
-  const [accessToken,   setAccessToken]   = useState<string>("");
-  const [deleteMode,    setDeleteMode]    = useState(false);
-  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
-  const [deleteLoading, setDeleteLoading] = useState(false);
-  const [deleteMsg,     setDeleteMsg]     = useState<string | null>(null);
+  const [isAdmin,        setIsAdmin]        = useState(false);
+  const [accessToken,    setAccessToken]    = useState<string>("");
+  const [deleteMode,     setDeleteMode]     = useState(false);
+  const [selectedItems,  setSelectedItems]  = useState<Set<string>>(new Set());
+  const [deleteLoading,  setDeleteLoading]  = useState(false);
+  const [deleteMsg,      setDeleteMsg]      = useState<string | null>(null);
+  const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
+
+  const DELETE_CHUNK_SIZE = 500; // 청크당 최대 항목 수 (타임아웃 방지)
 
   // ── 인증 확인 + 관리자 여부 ──
   useEffect(() => {
@@ -190,19 +193,41 @@ export default function OrdersPage() {
 
   const handleDeleteSelected = async () => {
     if (selectedItems.size === 0) return;
-    if (!confirm(`선택된 ${selectedItems.size.toLocaleString()}건을 삭제합니다.\n이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?`)) return;
+    if (!confirm(
+      `선택된 ${selectedItems.size.toLocaleString()}건을 삭제합니다.\n이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?`
+    )) return;
+
     setDeleteLoading(true);
     setDeleteMsg(null);
+    setDeleteProgress(null);
+
+    // 500개씩 청크 분할 (Railway 타임아웃 방지)
+    const allIds   = Array.from(selectedItems);
+    const chunks: string[][] = [];
+    for (let i = 0; i < allIds.length; i += DELETE_CHUNK_SIZE) {
+      chunks.push(allIds.slice(i, i + DELETE_CHUNK_SIZE));
+    }
+
+    let totalDeleted = 0;
     try {
-      const res = await deleteItems(Array.from(selectedItems), accessToken);
-      setDeleteMsg(`✅ ${res.deleted}건 삭제 완료`);
+      for (let i = 0; i < chunks.length; i++) {
+        setDeleteProgress({ done: i, total: chunks.length });
+        const res = await deleteItems(chunks[i], accessToken);
+        totalDeleted += (res.deleted as number) || 0;
+      }
+      setDeleteProgress({ done: chunks.length, total: chunks.length });
+      setDeleteMsg(`✅ ${totalDeleted.toLocaleString()}건 삭제 완료`);
       setSelectedItems(new Set());
       setDeleteMode(false);
       await loadOrders();
     } catch (e: unknown) {
-      setDeleteMsg(`❌ 삭제 실패: ${e instanceof Error ? e.message : String(e)}`);
+      const errMsg = e instanceof Error ? e.message : String(e);
+      setDeleteMsg(
+        `❌ 삭제 중 오류 (${totalDeleted.toLocaleString()}건 완료 후): ${errMsg}`
+      );
     } finally {
       setDeleteLoading(false);
+      setDeleteProgress(null);
     }
   };
 
@@ -430,30 +455,50 @@ export default function OrdersPage() {
 
               {/* 관리자 삭제 모드 액션 바 */}
               {deleteMode && (
-                <div className="shrink-0 flex items-center gap-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg">
-                  <span className="text-sm text-red-700 font-medium">
-                    {selectedItems.size > 0
-                      ? `${selectedItems.size.toLocaleString()}건 선택됨`
-                      : "삭제할 항목을 체크하세요"}
-                  </span>
-                  <button
-                    onClick={handleDeleteSelected}
-                    disabled={selectedItems.size === 0 || deleteLoading}
-                    className="px-3 py-1.5 bg-red-600 text-white text-sm rounded-lg font-medium hover:bg-red-700 disabled:opacity-40 transition"
-                  >
-                    {deleteLoading ? "삭제 중..." : `🗑️ 선택 삭제 (${selectedItems.size.toLocaleString()}건)`}
-                  </button>
-                  <button
-                    onClick={() => setSelectedItems(new Set())}
-                    disabled={selectedItems.size === 0}
-                    className="px-3 py-1.5 text-sm text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 transition"
-                  >
-                    선택 해제
-                  </button>
-                  {deleteMsg && (
-                    <span className={`text-sm font-medium ${deleteMsg.startsWith("✅") ? "text-green-700" : "text-red-700"}`}>
-                      {deleteMsg}
+                <div className="shrink-0 flex flex-col gap-1.5 px-3 py-2 bg-red-50 border border-red-200 rounded-lg">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <span className="text-sm text-red-700 font-medium">
+                      {selectedItems.size > 0
+                        ? `${selectedItems.size.toLocaleString()}건 선택됨`
+                        : "삭제할 항목을 체크하세요"}
                     </span>
+                    <button
+                      onClick={handleDeleteSelected}
+                      disabled={selectedItems.size === 0 || deleteLoading}
+                      className="px-3 py-1.5 bg-red-600 text-white text-sm rounded-lg font-medium hover:bg-red-700 disabled:opacity-40 transition"
+                    >
+                      {deleteLoading
+                        ? (deleteProgress
+                            ? `삭제 중... ${deleteProgress.done}/${deleteProgress.total}`
+                            : "삭제 중...")
+                        : `🗑️ 선택 삭제 (${selectedItems.size.toLocaleString()}건)`}
+                    </button>
+                    <button
+                      onClick={() => setSelectedItems(new Set())}
+                      disabled={selectedItems.size === 0 || deleteLoading}
+                      className="px-3 py-1.5 text-sm text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 transition"
+                    >
+                      선택 해제
+                    </button>
+                    {deleteMsg && (
+                      <span className={`text-sm font-medium ${deleteMsg.startsWith("✅") ? "text-green-700" : "text-red-700"}`}>
+                        {deleteMsg}
+                      </span>
+                    )}
+                  </div>
+                  {/* 진행률 프로그레스 바 (삭제 중에만 표시) */}
+                  {deleteLoading && deleteProgress && deleteProgress.total > 1 && (
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 bg-red-200 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-red-600 h-1.5 rounded-full transition-all duration-300"
+                          style={{ width: `${Math.round((deleteProgress.done / deleteProgress.total) * 100)}%` }}
+                        />
+                      </div>
+                      <span className="text-xs text-red-600 whitespace-nowrap">
+                        {Math.round((deleteProgress.done / deleteProgress.total) * 100)}%
+                      </span>
+                    </div>
                   )}
                 </div>
               )}

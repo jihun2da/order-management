@@ -390,61 +390,107 @@ async def delete_items(
                         .delete().in_("id", chunk).execute()
                     orphan_deleted += len(chunk_od.data or [])
 
-                # ── 3-c) 번호 재활용 처리 (rollback_upload 와 동일 로직) ──
-                for order in orphan_orders:
-                    buyer_id     = order.get("buyer_id")
-                    consignor_id = order.get("consignor_id")
-                    manager_id   = order.get("manager_id")
-                    order_no     = order.get("order_no", "")
-                    mc           = mgr_map.get(manager_id, "") if manager_id else ""
-                    if not mc or not order_no:
-                        continue
+                # ── 3-c) 번호 재활용 처리 (배치 최적화 버전) ──
+                #
+                # 최적화 포인트:
+                #   ① orphan_orders를 (buyer,consignor,manager) 유일 그룹으로 중복 제거
+                #      → O(orphan_orders) 쿼리 → O(unique_groups) 쿼리
+                #   ② completed_order_numbers 중복 확인을 그룹 배치 조회로 교체
+                #      → N회 개별 조회 → 1~수회 배치 조회
+                #   ③ completed_order_numbers 삽입을 일괄 insert로 교체
+                #   ④ buyer_consignor_counters 삭제는 유일 그룹당 1회로 중복 방지
+                #
+                # 3-c-1) 유일 그룹 추출
+                unique_groups: dict = {}   # (buyer_id, consignor_id, manager_id) -> order
+                for _ord in orphan_orders:
+                    _key = (_ord.get("buyer_id"), _ord.get("consignor_id"), _ord.get("manager_id"))
+                    if _key not in unique_groups:
+                        unique_groups[_key] = _ord
 
-                    # 같은 (buyer, consignor, manager) 그룹의 다른 orders 가 남아있는지 확인
-                    # → 남아있다면 카운터가 여전히 사용 중이므로 재활용 안 함
-                    chk_q = supabase.table("orders").select("id", count="exact") \
-                        .eq("buyer_id", buyer_id).eq("manager_id", manager_id)
-                    if consignor_id:
-                        chk_q = chk_q.eq("consignor_id", consignor_id)
+                # 3-c-2) 각 유일 그룹에 대해 잔존 orders 여부 확인 (그룹당 1회, limit 1)
+                #   .select("id", count="exact").limit(1) 은 행은 1개만 반환하지만
+                #   result.count 에는 실제 총 건수가 담김 (PostgREST Content-Range 헤더)
+                groups_to_recycle: set = set()
+                for (_bid, _cid, _mid), _ in unique_groups.items():
+                    if not _bid or not _mid:
+                        continue
+                    _chk = supabase.table("orders").select("id", count="exact") \
+                        .eq("buyer_id", _bid).eq("manager_id", _mid).limit(1)
+                    if _cid:
+                        _chk = _chk.eq("consignor_id", _cid)
                     else:
-                        chk_q = chk_q.is_("consignor_id", "null")
-                    other_count = (chk_q.execute().count or 0)
+                        _chk = _chk.is_("consignor_id", "null")
+                    if (_chk.execute().count or 0) == 0:
+                        groups_to_recycle.add((_bid, _cid, _mid))
 
-                    if other_count > 0:
-                        # 같은 그룹의 주문이 아직 있으므로 카운터 유지
-                        continue
+                if groups_to_recycle:
+                    # 3-c-3) 재활용 후보 목록 구성 (base_number 추출 포함)
+                    candidates: list = []
+                    for _ord in orphan_orders:
+                        _bid     = _ord.get("buyer_id")
+                        _cid     = _ord.get("consignor_id")
+                        _mid     = _ord.get("manager_id")
+                        _gkey    = (_bid, _cid, _mid)
+                        if _gkey not in groups_to_recycle:
+                            continue
+                        _ono = _ord.get("order_no", "")
+                        _mc  = mgr_map.get(_mid, "") if _mid else ""
+                        if not _mc or not _ono:
+                            continue
+                        _m = re.search(r"-(\d+)\(", _ono)
+                        if not _m:
+                            continue
+                        candidates.append({
+                            "order_no":    _ono,
+                            "manager_code": _mc,
+                            "base_number":  int(_m.group(1)),
+                            "_buyer_id":    _bid,
+                            "_consignor_id": _cid,
+                        })
 
-                    # base_number 추출: order_no 패턴 "-숫자(" (롤백 SQL 정규식과 동일)
-                    m = re.search(r"-(\d+)\(", order_no)
-                    if not m:
-                        continue
-                    base_num = int(m.group(1))
+                    if candidates:
+                        # 3-c-4) 기존 completed_order_numbers 일괄 조회 (배치)
+                        #   → base_number 목록으로 한 번에 조회 후 Python에서 (mc, base) 튜플 비교
+                        _all_bases = list({c["base_number"] for c in candidates})
+                        _existing: set = set()
+                        for _chunk in _sb_chunks(_all_bases):
+                            _ex = supabase.table("completed_order_numbers") \
+                                .select("manager_code, base_number") \
+                                .in_("base_number", _chunk).execute().data or []
+                            _existing.update((r["manager_code"], r["base_number"]) for r in _ex)
 
-                    # completed_order_numbers 에 추가 (중복 방지)
-                    existing_recycled = supabase.table("completed_order_numbers") \
-                        .select("id") \
-                        .eq("manager_code", mc) \
-                        .eq("base_number", base_num) \
-                        .execute().data or []
-                    if not existing_recycled:
-                        supabase.table("completed_order_numbers").insert({
-                            "order_no":     order_no,
-                            "manager_code": mc,
-                            "base_number":  base_num,
-                        }).execute()
-                        recycled_count += 1
-                        print(f"[ADMIN DELETE] 번호 재활용 등록: {order_no} (mc={mc}, base={base_num})")
+                        # 3-c-5) 신규만 필터링 후 일괄 삽입 (최대 200개씩)
+                        _new = [
+                            {"order_no": c["order_no"], "manager_code": c["manager_code"], "base_number": c["base_number"]}
+                            for c in candidates
+                            if (c["manager_code"], c["base_number"]) not in _existing
+                        ]
+                        for _chunk in _sb_chunks(_new, 200):
+                            if _chunk:
+                                try:
+                                    supabase.table("completed_order_numbers").insert(_chunk).execute()
+                                except Exception as _ie:
+                                    # 극히 드문 동시 삽입 race → 경고만 기록하고 계속 진행
+                                    print(f"[WARN] completed_order_numbers 삽입 충돌 (무시): {_ie}")
+                        recycled_count = len(_new)
+                        print(f"[ADMIN DELETE] 번호 재활용 등록: {recycled_count}건")
 
-                    # buyer_consignor_counters 카운터 해제
-                    del_ctr_q = supabase.table("buyer_consignor_counters") \
-                        .delete() \
-                        .eq("buyer_id", buyer_id) \
-                        .eq("manager_code", mc)
-                    if consignor_id:
-                        del_ctr_q = del_ctr_q.eq("consignor_id", consignor_id)
-                    else:
-                        del_ctr_q = del_ctr_q.is_("consignor_id", "null")
-                    del_ctr_q.execute()
+                        # 3-c-6) buyer_consignor_counters 카운터 해제 (유일 그룹당 1회)
+                        _done_ctr: set = set()
+                        for c in candidates:
+                            _gk = (c["_buyer_id"], c["_consignor_id"], c["manager_code"])
+                            if _gk in _done_ctr:
+                                continue
+                            _done_ctr.add(_gk)
+                            _dctr = supabase.table("buyer_consignor_counters") \
+                                .delete() \
+                                .eq("buyer_id", c["_buyer_id"]) \
+                                .eq("manager_code", c["manager_code"])
+                            if c["_consignor_id"]:
+                                _dctr = _dctr.eq("consignor_id", c["_consignor_id"])
+                            else:
+                                _dctr = _dctr.is_("consignor_id", "null")
+                            _dctr.execute()
 
         print(f"[ADMIN DELETE] 완료 — items:{deleted_count}, orphan orders:{orphan_deleted}, recycled:{recycled_count}")
         return {
