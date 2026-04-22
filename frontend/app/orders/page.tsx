@@ -70,7 +70,8 @@ export default function OrdersPage() {
   const [deleteMsg,      setDeleteMsg]      = useState<string | null>(null);
   const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
 
-  const DELETE_CHUNK_SIZE = 500; // 청크당 최대 항목 수 (타임아웃 방지)
+  const DELETE_CHUNK_SIZE = 100; // 청크당 최대 항목 수 (Supabase 과부하 방지)
+  const DELETE_CHUNK_DELAY = 300; // 청크 간 딜레이 ms (Supabase 커넥션 풀 보호)
 
   // ── 인증 확인 + 관리자 여부 ──
   useEffect(() => {
@@ -214,6 +215,10 @@ export default function OrdersPage() {
         setDeleteProgress({ done: i, total: chunks.length });
         const res = await deleteItems(chunks[i], accessToken);
         totalDeleted += (res.deleted as number) || 0;
+        // 청크 간 딜레이 — Supabase 커넥션 풀 과부하 방지 (마지막 청크 제외)
+        if (i < chunks.length - 1) {
+          await new Promise((r) => setTimeout(r, DELETE_CHUNK_DELAY));
+        }
       }
       setDeleteProgress({ done: chunks.length, total: chunks.length });
       setDeleteMsg(`✅ ${totalDeleted.toLocaleString()}건 삭제 완료`);

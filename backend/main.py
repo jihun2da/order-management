@@ -8,6 +8,7 @@ import os
 import io
 import re
 import sys
+import asyncio
 import threading
 import urllib.parse
 from typing import List
@@ -323,55 +324,57 @@ async def delete_items(
     """
     if not body.item_ids:
         raise HTTPException(status_code=400, detail="삭제할 항목 ID가 없습니다.")
-    if len(body.item_ids) > 5000:
-        raise HTTPException(status_code=400, detail="한 번에 최대 5,000건까지 삭제 가능합니다.")
+    if len(body.item_ids) > 200:
+        raise HTTPException(status_code=400, detail="한 번에 최대 200건까지 삭제 가능합니다. (프론트에서 100건씩 분할 처리 필요)")
 
     supabase = get_supabase()
     try:
         print(f"[ADMIN DELETE] {admin['email']} → {len(body.item_ids)}건 삭제 요청")
 
+        # Supabase 과부하 방지용 쿼리 간 딜레이 (100ms)
+        _SB_DELAY = 0.10
+
         # 1) 삭제 대상 order_items의 order_id 수집 (orphan 정리용)
-        #    ★ 청크 분할 — body.item_ids 최대 5,000개, URL 초과 방지
         items_data: list = []
         for chunk in _sb_chunks(body.item_ids):
             chunk_resp = supabase.table("order_items").select("id, order_id") \
                 .in_("id", chunk).execute()
             items_data.extend(chunk_resp.data or [])
+            await asyncio.sleep(_SB_DELAY)
         order_ids = list({r["order_id"] for r in items_data})
 
         # 2) order_items 삭제 (status_logs는 CASCADE 자동 삭제)
-        #    ★ 청크 분할
         deleted_count = 0
         for chunk in _sb_chunks(body.item_ids):
             chunk_del = supabase.table("order_items") \
                 .delete().in_("id", chunk).execute()
             deleted_count += len(chunk_del.data or [])
+            await asyncio.sleep(_SB_DELAY)
 
         # 3) orphan orders 정리 (order_items가 0건인 orders 삭제)
         orphan_deleted  = 0
         recycled_count  = 0
         if order_ids:
-            # ★ 청크 분할 — order_ids 크기도 가변적
             remaining_data: list = []
             for chunk in _sb_chunks(order_ids):
                 chunk_rem = supabase.table("order_items").select("order_id") \
                     .in_("order_id", chunk).execute()
                 remaining_data.extend(chunk_rem.data or [])
+                await asyncio.sleep(_SB_DELAY)
             remaining_ids = {r["order_id"] for r in remaining_data}
             orphan_ids = [oid for oid in order_ids if oid not in remaining_ids]
 
             if orphan_ids:
                 # ── 3-a) orphan orders 상세 조회 (삭제 전에 수집해야 함) ──
-                #         ★ 청크 분할
                 orphan_orders: list = []
                 for chunk in _sb_chunks(orphan_ids):
                     chunk_oo = supabase.table("orders") \
                         .select("id, order_no, buyer_id, consignor_id, manager_id") \
                         .in_("id", chunk).execute()
                     orphan_orders.extend(chunk_oo.data or [])
+                    await asyncio.sleep(_SB_DELAY)
 
                 # manager_id → manager_code 매핑
-                #   ★ 청크 분할 (mgr_ids 는 보통 소수이지만 안전하게)
                 mgr_ids = list({o["manager_id"] for o in orphan_orders if o.get("manager_id")})
                 mgr_map: dict = {}
                 if mgr_ids:
@@ -380,15 +383,16 @@ async def delete_items(
                         chunk_mgr = supabase.table("managers").select("id, code") \
                             .in_("id", chunk).execute()
                         mgrs_data.extend(chunk_mgr.data or [])
+                        await asyncio.sleep(_SB_DELAY)
                     mgr_map = {m["id"]: m["code"] for m in mgrs_data}
 
-                # ── 3-b) orphan orders 삭제 (기존 로직 유지) ──
-                #         ★ 청크 분할
+                # ── 3-b) orphan orders 삭제 ──
                 orphan_deleted = 0
                 for chunk in _sb_chunks(orphan_ids):
                     chunk_od = supabase.table("orders") \
                         .delete().in_("id", chunk).execute()
                     orphan_deleted += len(chunk_od.data or [])
+                    await asyncio.sleep(_SB_DELAY)
 
                 # ── 3-c) 번호 재활용 처리 (배치 최적화 버전) ──
                 #
@@ -450,7 +454,6 @@ async def delete_items(
 
                     if candidates:
                         # 3-c-4) 기존 completed_order_numbers 일괄 조회 (배치)
-                        #   → base_number 목록으로 한 번에 조회 후 Python에서 (mc, base) 튜플 비교
                         _all_bases = list({c["base_number"] for c in candidates})
                         _existing: set = set()
                         for _chunk in _sb_chunks(_all_bases):
@@ -458,19 +461,20 @@ async def delete_items(
                                 .select("manager_code, base_number") \
                                 .in_("base_number", _chunk).execute().data or []
                             _existing.update((r["manager_code"], r["base_number"]) for r in _ex)
+                            await asyncio.sleep(_SB_DELAY)
 
-                        # 3-c-5) 신규만 필터링 후 일괄 삽입 (최대 200개씩)
+                        # 3-c-5) 신규만 필터링 후 일괄 삽입 (최대 100개씩)
                         _new = [
                             {"order_no": c["order_no"], "manager_code": c["manager_code"], "base_number": c["base_number"]}
                             for c in candidates
                             if (c["manager_code"], c["base_number"]) not in _existing
                         ]
-                        for _chunk in _sb_chunks(_new, 200):
+                        for _chunk in _sb_chunks(_new, 100):
                             if _chunk:
                                 try:
                                     supabase.table("completed_order_numbers").insert(_chunk).execute()
+                                    await asyncio.sleep(_SB_DELAY)
                                 except Exception as _ie:
-                                    # 극히 드문 동시 삽입 race → 경고만 기록하고 계속 진행
                                     print(f"[WARN] completed_order_numbers 삽입 충돌 (무시): {_ie}")
                         recycled_count = len(_new)
                         print(f"[ADMIN DELETE] 번호 재활용 등록: {recycled_count}건")
@@ -491,6 +495,7 @@ async def delete_items(
                             else:
                                 _dctr = _dctr.is_("consignor_id", "null")
                             _dctr.execute()
+                            await asyncio.sleep(_SB_DELAY)
 
         print(f"[ADMIN DELETE] 완료 — items:{deleted_count}, orphan orders:{orphan_deleted}, recycled:{recycled_count}")
         return {
@@ -512,6 +517,56 @@ async def delete_items(
 async def admin_me(admin: dict = Depends(verify_admin)):
     """관리자 여부 확인용 (프론트엔드 초기화 시 호출)"""
     return {"email": admin["email"], "is_admin": True}
+
+
+# ─────────────────────────────────────
+# 관리자 — DB 완전 초기화
+# ─────────────────────────────────────
+@app.post("/api/admin/full-reset")
+async def full_reset(admin: dict = Depends(verify_admin)):
+    """
+    주문 관련 DB 전체 초기화.
+    삭제 대상: order_item_status_logs → order_items → orders →
+              upload_history → buyer_consignor_counters → completed_order_numbers
+    보존 대상: managers (담당자), auth.users (로그인 계정)
+    """
+    supabase = get_supabase()
+    result: dict = {}
+    _RESET_DELAY = 0.15  # 각 테이블 작업 간 딜레이
+
+    # 삭제 순서: 자식 테이블 → 부모 테이블 (FK 제약 순서)
+    tables = [
+        "order_item_status_logs",
+        "order_items",
+        "orders",
+        "upload_history",
+        "buyer_consignor_counters",
+        "completed_order_numbers",
+    ]
+
+    print(f"[FULL RESET] {admin['email']} 요청 — 초기화 시작")
+
+    for tbl in tables:
+        deleted = 0
+        try:
+            # 1000개씩 ID를 가져와서 100개씩 삭제 (URL 길이 안전)
+            while True:
+                rows = supabase.table(tbl).select("id").limit(1000).execute()
+                if not rows.data:
+                    break
+                ids = [r["id"] for r in rows.data]
+                for chunk in _sb_chunks(ids, 100):
+                    supabase.table(tbl).delete().in_("id", chunk).execute()
+                    deleted += len(chunk)
+                    await asyncio.sleep(_RESET_DELAY)
+            result[tbl] = deleted
+            print(f"[FULL RESET] {tbl}: {deleted}건 삭제 완료")
+        except Exception as e:
+            result[tbl] = f"오류: {str(e)}"
+            print(f"[FULL RESET] {tbl} 오류: {e}")
+
+    print(f"[FULL RESET] 완료: {result}")
+    return {"success": True, "reset": result, "message": "DB 초기화 완료 (managers·auth 보존)"}
 
 
 # ─────────────────────────────────────
